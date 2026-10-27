@@ -3,21 +3,24 @@
  COSMIC LINK - Sci-Fi Spatial Control Center & Instant Screen Pop-Up Engine
 =============================================================================
  Features:
- 1. Gaming Radar HUD:
-    - 360° circular tactical radar displaying nearby laptops as glowing blips.
-    - Live heading reticle tracking the Air Mouse aim.
-    - Gesture-based Point & Click to Pair (aim at target laptop and click).
- 2. Floating Desktop HUD Overlay:
-    - Translucent HUD pill that appears during "Hold to Beam":
-      [⚡ READY TO SEND] -> [🎯 TARGET LOCKED: LAPTOP B] -> [✔ SENT!]
- 3. Zero-Confirmation Screen Pop-up Engine (Bidirectional):
-    - Both sender and receiver auto-receive files/screenshots.
-    - Automatically creates and manages local DropZone folder.
-    - Instantly launches received media full-screen with zero prompts.
- 4. Secure Wi-Fi Discovery:
-    - Protected with a Private Pairing Key (blocks strangers on public Wi-Fi).
- 5. Live Sensitivity & Smoothing Controls:
-    - Real-time adjustment without recompiling firmware.
+ 1. Button 3 Single-Click Toggle & Hold-to-Beam Spatial Flow:
+    - Button 3 Single Click: Toggles BLE profile slot for another laptop on ESP32.
+    - Button 3 Hold: Initiates 360° spatial aiming (mouse physically moves reticle).
+    - Release Button 3: Transmits staged file/screenshot to locked target laptop!
+ 2. Tactical Spatial Radar with Interactive Key-Based Pairing:
+    - Wi-Fi discovery prompts both laptops to confirm pairing with the shared Key.
+    - User on Laptop A physically points Air Mouse at Laptop B and clicks "Lock Aim".
+    - Laptop A automatically synchronizes spatial coordinates over Wi-Fi to Laptop B,
+      so Laptop B automatically knows Laptop A's location on its radar (zero manual setup on B!).
+ 3. Zero-Confirmation Screen Pop-up Engine:
+    - Auto-receives into CosmicDropZone folder.
+    - Instantly opens / displays received media full-screen with zero prompt!
+ 4. Hardware Live Tuning with Freeze & Calibrate Workflow:
+    - Dedicated "Freeze Mouse for Tuning" button: ESP32 ignores gyro movement
+      so cursor won't move across the screen while adjusting sliders.
+    - User tunes Sensitivity and Smoothing.
+    - User clicks "Confirm & Calibrate Air Mouse" -> writes to ESP32 Flash,
+      runs gyro calibration, and automatically unfreezes the mouse!
 =============================================================================
 """
 
@@ -45,6 +48,12 @@ try:
 except ImportError:
     mouse = None
     keyboard = None
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
 
 # =============================================================================
 # CONSTANTS & NETWORKING PORTS
@@ -91,7 +100,9 @@ class ConfigManager:
             "sensitivity": 0.20,
             "smoothing": 0.82,
             "deadzone": 1,
-            "devices": {}  # name -> {"ip": ..., "angle": float, "last_seen": float}
+            "serial_port": "",
+            "desk_layout": "side_by_side",  # "side_by_side" or "opposite"
+            "devices": {}  # name -> {"ip": ..., "angle": float, "last_seen": float, "trusted": bool}
         }
         self.load()
 
@@ -111,37 +122,111 @@ class ConfigManager:
         except Exception as e:
             print(f"[CONFIG] Error saving config: {e}")
 
-# -------------------------------------------------------------------------------
-# RESET TO DEFAULTS FUNCTIONALITY
-# -------------------------------------------------------------------------------
-def reset_to_defaults():
-    """Delete user config and restore defaults.
-    Also clears the DropZone folder.
-    """
-    # Remove config file if it exists
-    if os.path.exists(CONFIG_FILE):
+
+# =============================================================================
+# ESP32 HARDWARE SERIAL BRIDGE
+# Communicates with ESP32 Air Mouse for Freeze, Live Tuning & Gyro Calibration
+# =============================================================================
+class ESP32SerialBridge:
+    def __init__(self, log_fn=None):
+        self.ser = None
+        self.current_port = None
+        self.log_fn = log_fn or (lambda msg: print(msg))
+        self.is_frozen = False
+        self.reader_thread = None
+        self.running = False
+
+    def list_ports(self):
+        if not serial:
+            return []
+        ports = serial.tools.list_ports.comports()
+        return [p.device for p in ports]
+
+    def connect(self, port):
+        if not serial:
+            self.log_fn("[SERIAL] pyserial is not installed.")
+            return False
+
+        if self.ser and self.ser.is_open:
+            self.disconnect()
+
         try:
-            os.remove(CONFIG_FILE)
-            print(f"[RESET] Removed config file: {CONFIG_FILE}")
+            self.ser = serial.Serial(port, 115200, timeout=1.0)
+            self.current_port = port
+            self.running = True
+            self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+            self.reader_thread.start()
+            self.log_fn(f"[SERIAL] Connected to ESP32 Air Mouse on {port} (115200 baud)")
+            return True
         except Exception as e:
-            print(f"[RESET] Failed to delete config: {e}")
+            self.log_fn(f"[SERIAL] Failed to connect to {port}: {e}")
+            self.ser = None
+            return False
 
-    # Re‑create default config by instantiating ConfigManager (writes defaults)
-    cfg_mgr = ConfigManager()
-    cfg_mgr.save()
-    print("[RESET] Default configuration saved.")
+    def disconnect(self):
+        self.running = False
+        if self.ser:
+            try:
+                if self.is_frozen:
+                    self.unfreeze_mouse()
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+        self.log_fn("[SERIAL] Disconnected from ESP32 Air Mouse.")
 
-    # Clean DropZone folder (remove all files)
-    if os.path.isdir(DEFAULT_DROPZONE):
-        try:
-            for fname in os.listdir(DEFAULT_DROPZONE):
-                fpath = os.path.join(DEFAULT_DROPZONE, fname)
-                if os.path.isfile(fpath):
-                    os.remove(fpath)
-            print(f"[RESET] Cleared DropZone folder: {DEFAULT_DROPZONE}")
-        except Exception as e:
-            print(f"[RESET] Failed to clear DropZone: {e}")
+    def _read_loop(self):
+        while self.running and self.ser and self.ser.is_open:
+            try:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if line:
+                    self.log_fn(f"[ESP32] {line}")
+            except Exception:
+                break
 
+    def send_command(self, cmd):
+        if self.ser and self.ser.is_open:
+            try:
+                payload = (cmd.strip() + "\n").encode("utf-8")
+                self.ser.write(payload)
+                self.ser.flush()
+                return True
+            except Exception as e:
+                self.log_fn(f"[SERIAL] Error sending '{cmd}': {e}")
+                return False
+        return False
+
+    def freeze_mouse(self):
+        """Signals ESP32 to freeze mouse movement and button clicks."""
+        if self.send_command("FREEZE"):
+            self.is_frozen = True
+            self.log_fn("❄️ [HARDWARE] ESP32 Air Mouse FROZEN for tuning. Cursor will not move.")
+            return True
+        return False
+
+    def unfreeze_mouse(self):
+        """Signals ESP32 to restore mouse movement."""
+        if self.send_command("UNFREEZE"):
+            self.is_frozen = False
+            self.log_fn("🟢 [HARDWARE] ESP32 Air Mouse UNFROZEN. Normal control restored.")
+            return True
+        return False
+
+    def calibrate_and_apply(self, sensitivity, smoothing):
+        """Sends sensitivity, smoothing, triggers gyro calibration, and unfreezes."""
+        if not (self.ser and self.ser.is_open):
+            self.log_fn("[SERIAL] ESP32 not connected over USB/Serial. Settings saved locally.")
+            return False
+
+        self.send_command(f"SENS:{sensitivity:.2f}")
+        time.sleep(0.05)
+        self.send_command(f"SMOOTH:{smoothing:.2f}")
+        time.sleep(0.05)
+
+        self.send_command("CALIBRATE")
+        self.is_frozen = False
+        self.log_fn(f"🚀 [HARDWARE] Flashed Sens: {sensitivity:.2f}, Smooth: {smoothing:.2f}. Calibrating Gyro...")
+        return True
 
 
 # =============================================================================
@@ -153,6 +238,7 @@ class FloatingHUD:
         self.root = root
         self.hud_win = None
         self.label = None
+        self.frame = None
         self.fade_job = None
 
     def show(self, text, status="ready"):
@@ -161,15 +247,14 @@ class FloatingHUD:
             self.hud_win.overrideredirect(True)
             self.hud_win.attributes("-topmost", True)
             try:
-                self.hud_win.attributes("-alpha", 0.90)
+                self.hud_win.attributes("-alpha", 0.92)
             except Exception:
                 pass
 
-            # Center horizontally at the top of the main screen
             sw = self.hud_win.winfo_screenwidth()
-            w, h = 440, 50
+            w, h = 480, 52
             x = (sw - w) // 2
-            y = 40
+            y = 35
             self.hud_win.geometry(f"{w}x{h}+{x}+{y}")
 
             self.frame = tk.Frame(self.hud_win, bg="#0d1117", bd=2, relief="ridge")
@@ -178,7 +263,7 @@ class FloatingHUD:
             self.label = tk.Label(
                 self.frame,
                 text=text,
-                font=("Segoe UI", 12, "bold"),
+                font=("Segoe UI", 11, "bold"),
                 bg="#0d1117",
                 fg="#58a6ff"
             )
@@ -186,17 +271,16 @@ class FloatingHUD:
         else:
             self.hud_win.deiconify()
 
-        # Color accents based on status
         if status == "ready":
             self.label.config(text=text, fg="#79c0ff")
             self.frame.config(highlightbackground="#1f6feb", highlightthickness=1)
         elif status == "locked":
-            self.label.config(text="🎯 TARGET LOCKED", fg="#3fb950")  # Glowing green clean target locked
+            self.label.config(text=text, fg="#3fb950")
             self.frame.config(highlightbackground="#238636", highlightthickness=2)
         elif status == "sent":
-            self.label.config(text="✔ SENT!", fg="#a371f7")  # Clean sent message
+            self.label.config(text=text, fg="#a371f7")
             self.frame.config(highlightbackground="#8957e5", highlightthickness=2)
-            self.auto_hide(1500)
+            self.auto_hide(2000)
 
     def auto_hide(self, delay_ms):
         if self.fade_job:
@@ -220,12 +304,12 @@ class RadarCanvas(tk.Canvas):
         self.radius = self.center - 20
         self.current_yaw = 0.0
         self.locked_target = None
-        self.devices = {}  # name -> {"angle": float, "ip": str}
+        self.devices = {}
         self.sweep_angle = 0.0
+        self.selected_blip = None
 
         self.bind("<Button-1>", self.on_click)
         self.bind("<B1-Motion>", self.on_drag)
-        self.selected_blip = None
         self.animate_sweep()
 
     def set_devices(self, devices):
@@ -246,7 +330,7 @@ class RadarCanvas(tk.Canvas):
         self.delete("all")
         cx, cy, r = self.center, self.center, self.radius
 
-        # 1. Concentric Cosmic Range Rings
+        # 1. Concentric Range Rings
         for ratio in [0.33, 0.66, 1.0]:
             ring_r = r * ratio
             self.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r, outline="#162c3d", width=1)
@@ -266,7 +350,7 @@ class RadarCanvas(tk.Canvas):
         sy = cy + r * math.sin(rad)
         self.create_line(cx, cy, sx, sy, fill="#005533", width=2)
 
-        # 4. Center Dot (YOU / COSMIC AIR MOUSE)
+        # 4. Center Dot (YOU / AIR MOUSE)
         self.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill="#58a6ff", outline="#79c0ff", width=2)
         self.create_text(cx, cy + 14, text="YOU", fill="#79c0ff", font=("Segoe UI", 8, "bold"))
 
@@ -282,14 +366,13 @@ class RadarCanvas(tk.Canvas):
             color = "#3fb950" if is_locked else "#f0883e"
             glow_color = "#2ea043" if is_locked else "#bd5610"
 
-            # Draw glowing blip
             b_size = 8 if is_locked else 6
             self.create_oval(bx - b_size - 3, by - b_size - 3, bx + b_size + 3, by + b_size + 3, fill="", outline=glow_color, width=2)
             self.create_oval(bx - b_size, by - b_size, bx + b_size, by + b_size, fill=color, outline="#ffffff", width=1)
 
-            # Blip Label
             tag = "LOCKED" if is_locked else f"{int(ang)}°"
-            self.create_text(bx, by - 14, text=f"{name}\n[{tag}]", fill=color, font=("Segoe UI", 8, "bold"), justify=tk.CENTER)
+            trusted_tag = "✔" if data.get("trusted", True) else "🔒"
+            self.create_text(bx, by - 14, text=f"{name} {trusted_tag}\n[{tag}]", fill=color, font=("Segoe UI", 8, "bold"), justify=tk.CENTER)
 
         # 6. Current Cosmic Reticle
         aim_rad = math.radians(self.current_yaw - 90)
@@ -306,7 +389,7 @@ class RadarCanvas(tk.Canvas):
             ang_rad = math.radians(ang - 90)
             bx = cx + blip_dist * math.cos(ang_rad)
             by = cy + blip_dist * math.sin(ang_rad)
-            if math.hypot(event.x - bx, event.y - by) < 15:
+            if math.hypot(event.x - bx, event.y - by) < 18:
                 self.selected_blip = name
                 return
         self.selected_blip = None
@@ -327,8 +410,9 @@ class RadarCanvas(tk.Canvas):
 class CosmicLinkApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("COSMIC LINK - Spatial Control Center")
-        self.root.geometry("820x620")
+        self.root.title("COSMIC LINK - Spatial Control Center (Stark Edition)")
+        self.root.geometry("880x700")
+        self.root.minsize(840, 650)
         self.root.configure(bg="#0d1117")
 
         self.cfg_mgr = ConfigManager()
@@ -337,12 +421,18 @@ class CosmicLinkApp:
         self.hud = FloatingHUD(self.root)
         self.local_ip = get_local_ip()
 
+        # ESP32 Serial Bridge
+        self.esp_bridge = ESP32SerialBridge(log_fn=self.log)
+
         # Motion & Spatial States
         self.current_yaw = 0.0
         self.zero_offset = 0.0
         self.is_holding_beam = False
         self.target_locked = None
-        self.pairing_pending_device = None
+        self.last_mouse_x = None
+
+        # Set of devices currently prompting for pairing to avoid duplicate popups
+        self.pending_pairings = set()
 
         # Build UI layout
         self.build_ui()
@@ -355,6 +445,9 @@ class CosmicLinkApp:
 
         # Start Mouse / Spatial Listener
         self.init_spatial_listener()
+
+        # Auto-connect serial if available
+        self.auto_connect_serial()
 
         # Periodic refresh loop
         self.root.after(100, self.update_loop)
@@ -378,58 +471,148 @@ class CosmicLinkApp:
         lbl_title = tk.Label(hdr, text="🌌 COSMIC LINK", font=("Segoe UI", 14, "bold"), bg="#161b22", fg="#58a6ff")
         lbl_title.pack(side=tk.LEFT, padx=15, pady=10)
 
-        lbl_status = tk.Label(hdr, text=f"Local IP: {self.local_ip}  |  Key: {self.cfg['pairing_key']}", font=("Segoe UI", 9), bg="#161b22", fg="#8b949e")
-        lbl_status.pack(side=tk.RIGHT, padx=15, pady=10)
+        # Pairing Key & IP
+        self.lbl_status = tk.Label(
+            hdr,
+            text=f"IP: {self.local_ip}  |  Pairing Key: {self.cfg['pairing_key']}",
+            font=("Segoe UI", 9, "bold"),
+            bg="#161b22",
+            fg="#8b949e"
+        )
+        self.lbl_status.pack(side=tk.RIGHT, padx=15, pady=10)
 
-        # Main Body Split (Left: Radar, Right: Controls & Logs)
+        # Main Body Split (Left: Radar, Right: Controls & Hardware)
         body = tk.Frame(self.root, bg="#0d1117")
         body.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
 
-        # Left Column: Radar HUD
+        # ----------------- Left Column: Radar HUD -----------------
         left_col = tk.Frame(body, bg="#161b22", bd=1, relief="ridge")
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        tk.Label(left_col, text="TACTICAL SPATIAL RADAR", font=("Segoe UI", 10, "bold"), bg="#161b22", fg="#58a6ff").pack(pady=8)
+        tk.Label(left_col, text="TACTICAL SPATIAL RADAR", font=("Segoe UI", 10, "bold"), bg="#161b22", fg="#58a6ff").pack(pady=6)
         self.radar = RadarCanvas(left_col, size=320)
-        self.radar.pack(pady=5)
+        self.radar.pack(pady=4)
         self.radar.set_devices(self.cfg["devices"])
 
+        # Radar Control Buttons
         btn_row = tk.Frame(left_col, bg="#161b22")
-        btn_row.pack(fill=tk.X, pady=8, padx=10)
+        btn_row.pack(fill=tk.X, pady=3, padx=10)
 
-        btn_recenter = tk.Button(btn_row, text="🎯 Re-center (0°)", bg="#238636", fg="white", font=("Segoe UI", 9, "bold"),
-                                 relief="flat", command=self.recenter_zero)
+        btn_recenter = tk.Button(
+            btn_row, text="🎯 Re-center (0°)", bg="#238636", fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", command=self.recenter_zero
+        )
         btn_recenter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
-        btn_test_beam = tk.Button(btn_row, text="⚡ Test Beam Now", bg="#1f6feb", fg="white", font=("Segoe UI", 9, "bold"),
-                                  relief="flat", command=self.trigger_manual_beam)
-        btn_test_beam.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        btn_lock_angle = tk.Button(
+            btn_row, text="📍 Point & Sync to Peer", bg="#1f6feb", fg="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", command=self.lock_heading_to_device
+        )
+        btn_lock_angle.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
-        # Right Column: Controls, Sliders & History
-        right_col = tk.Frame(body, bg="#161b22", bd=1, relief="ridge", width=380)
+        # Desk Layout Option (How laptops sit relative to each other)
+        layout_frame = tk.Frame(left_col, bg="#161b22")
+        layout_frame.pack(fill=tk.X, padx=12, pady=3)
+        tk.Label(layout_frame, text="Desk Geometry:", font=("Segoe UI", 8), bg="#161b22", fg="#8b949e").pack(side=tk.LEFT)
+        self.combo_layout = ttk.Combobox(layout_frame, width=22, state="readonly", values=[
+            "Side-by-Side (Facing User)",
+            "Opposite (Across Table)"
+        ])
+        saved_layout = self.cfg.get("desk_layout", "side_by_side")
+        self.combo_layout.set("Side-by-Side (Facing User)" if saved_layout == "side_by_side" else "Opposite (Across Table)")
+        self.combo_layout.pack(side=tk.RIGHT, padx=4)
+        self.combo_layout.bind("<<ComboboxSelected>>", self.on_layout_change)
+
+        btn_test_beam = tk.Button(
+            left_col, text="⚡ Beam Staged Payload Now", bg="#21262d", fg="#79c0ff", font=("Segoe UI", 9, "bold"),
+            relief="flat", command=self.trigger_manual_beam
+        )
+        btn_test_beam.pack(fill=tk.X, padx=12, pady=(4, 6))
+
+        # Instructions Note
+        lbl_hint = tk.Label(
+            left_col,
+            text="✨ Dual-Laptop Workflow:\n"
+                 "1. Pairing Key matches -> prompt appears on both laptops.\n"
+                 "2. Laptop A aims at Laptop B -> click 'Point & Sync to Peer'.\n"
+                 "3. Laptop B automatically plots Laptop A on its radar!\n"
+                 "4. Hold Button 3 & aim to beam files with zero prompts.\n"
+                 "5. Single-click Button 3 toggles controlling Laptop A/B.",
+            font=("Segoe UI", 8),
+            bg="#161b22",
+            fg="#8b949e",
+            justify=tk.LEFT
+        )
+        lbl_hint.pack(fill=tk.X, padx=12, pady=(0, 6))
+
+        # ----------------- Right Column: Hardware & Settings -----------------
+        right_col = tk.Frame(body, bg="#161b22", bd=1, relief="ridge", width=420)
         right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        tk.Label(right_col, text="HARDWARE & SHARING SETTINGS", font=("Segoe UI", 10, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W, padx=15, pady=8)
+        # 1. Pairing Key & Trust Section
+        key_frame = tk.Frame(right_col, bg="#161b22")
+        key_frame.pack(fill=tk.X, padx=15, pady=(8, 4))
+        tk.Label(key_frame, text="PAIRING & TRUST SETUP", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W)
 
-        # Auto Display Toggle
-        self.var_autodisplay = tk.BooleanVar(value=self.cfg.get("auto_display", True))
-        chk_auto = tk.Checkbutton(right_col, text="Instant Screen Display (Zero-Confirmation)", variable=self.var_autodisplay,
-                                  bg="#161b22", fg="#c9d1d9", selectcolor="#0d1117", activebackground="#161b22",
-                                  command=self.save_settings)
-        chk_auto.pack(anchor=tk.W, padx=15, pady=4)
+        kf_inner = tk.Frame(key_frame, bg="#161b22")
+        kf_inner.pack(fill=tk.X, pady=2)
+        tk.Label(kf_inner, text="Network Key:", bg="#161b22", fg="#c9d1d9").pack(side=tk.LEFT)
+        self.entry_key = tk.Entry(kf_inner, bg="#0d1117", fg="#58a6ff", font=("Segoe UI", 9, "bold"), width=15, relief="flat")
+        self.entry_key.insert(0, self.cfg.get("pairing_key", DEFAULT_PAIRING_KEY))
+        self.entry_key.pack(side=tk.LEFT, padx=6)
+        btn_update_key = tk.Button(kf_inner, text="Set Key", bg="#21262d", fg="#79c0ff", relief="flat", command=self.update_pairing_key)
+        btn_update_key.pack(side=tk.LEFT)
 
-        # DropZone Directory
-        dz_frame = tk.Frame(right_col, bg="#161b22")
-        dz_frame.pack(fill=tk.X, padx=15, pady=6)
-        tk.Label(dz_frame, text="Cosmic DropZone Folder:", font=("Segoe UI", 8), bg="#161b22", fg="#8b949e").pack(anchor=tk.W)
-        self.entry_dz = tk.Entry(dz_frame, bg="#0d1117", fg="#c9d1d9", insertbackground="#58a6ff", relief="flat")
-        self.entry_dz.insert(0, self.cfg.get("dropzone", DEFAULT_DROPZONE))
-        self.entry_dz.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=2)
-        btn_browse = tk.Button(dz_frame, text="📂", bg="#30363d", fg="white", relief="flat", command=self.browse_dropzone)
-        btn_browse.pack(side=tk.LEFT, padx=4)
+        # 2. Hardware Live Tuning (Freeze & Calibrate)
+        tk.Label(right_col, text="AIR MOUSE HARDWARE TUNING (SERIAL / USB)", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W, padx=15, pady=(8, 2))
 
-        # Wireless Sensitivity & Smoothing Sliders
-        tk.Label(right_col, text="Air Mouse Live Tuning (No Arduino Compile!):", font=("Segoe UI", 8, "bold"), bg="#161b22", fg="#8b949e").pack(anchor=tk.W, padx=15, pady=(10, 2))
+        # Serial COM Port Selector
+        port_frame = tk.Frame(right_col, bg="#161b22")
+        port_frame.pack(fill=tk.X, padx=15, pady=2)
+        tk.Label(port_frame, text="COM Port:", bg="#161b22", fg="#c9d1d9").pack(side=tk.LEFT)
+        self.combo_ports = ttk.Combobox(port_frame, width=12, state="readonly")
+        self.combo_ports.pack(side=tk.LEFT, padx=6)
+        btn_refresh_ports = tk.Button(port_frame, text="🔄", bg="#21262d", fg="white", relief="flat", command=self.refresh_serial_ports)
+        btn_refresh_ports.pack(side=tk.LEFT, padx=2)
+        self.btn_serial_connect = tk.Button(port_frame, text="Connect", bg="#238636", fg="white", relief="flat", command=self.toggle_serial_connection)
+        self.btn_serial_connect.pack(side=tk.LEFT, padx=4)
+
+        # Tuning Status Banner
+        self.lbl_hw_status = tk.Label(
+            right_col,
+            text="STATUS: 🟢 Ready (Live Active)",
+            font=("Segoe UI", 9, "bold"),
+            bg="#0d1117",
+            fg="#7ee787",
+            pady=3
+        )
+        self.lbl_hw_status.pack(fill=tk.X, padx=15, pady=3)
+
+        # Freeze Button
+        freeze_btn_row = tk.Frame(right_col, bg="#161b22")
+        freeze_btn_row.pack(fill=tk.X, padx=15, pady=2)
+
+        self.btn_freeze = tk.Button(
+            freeze_btn_row,
+            text="❄️ FREEZE AIR MOUSE FOR TUNING",
+            bg="#b62324",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+            relief="flat",
+            command=self.freeze_mouse_for_tuning
+        )
+        self.btn_freeze.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        self.btn_unfreeze = tk.Button(
+            freeze_btn_row,
+            text="🔓 Unfreeze",
+            bg="#30363d",
+            fg="#c9d1d9",
+            font=("Segoe UI", 9),
+            relief="flat",
+            command=self.unfreeze_mouse_manual
+        )
+        self.btn_unfreeze.pack(side=tk.LEFT, padx=2)
 
         # Sensitivity Slider
         s_frame = tk.Frame(right_col, bg="#161b22")
@@ -449,15 +632,57 @@ class CosmicLinkApp:
         self.slider_smooth.set(self.cfg.get("smoothing", 0.82))
         self.slider_smooth.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
 
-        # Transfer Log / Feed
-        tk.Label(right_col, text="Activity Log / Recent Beams:", font=("Segoe UI", 8, "bold"), bg="#161b22", fg="#8b949e").pack(anchor=tk.W, padx=15, pady=(10, 2))
-        self.txt_log = tk.Text(right_col, height=8, bg="#0d1117", fg="#7ee787", font=("Consolas", 8), relief="flat")
-        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 10))
+        # Confirm & Calibrate Button
+        self.btn_calibrate = tk.Button(
+            right_col,
+            text="🚀 CONFIRM, FLASH & CALIBRATE GYRO",
+            bg="#1f6feb",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+            relief="flat",
+            command=self.confirm_and_calibrate
+        )
+        self.btn_calibrate.pack(fill=tk.X, padx=15, pady=(3, 6))
+
+        # 3. Sharing & DropZone Settings
+        tk.Label(right_col, text="SHARING & DROPZONE", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W, padx=15, pady=(4, 2))
+
+        self.var_autodisplay = tk.BooleanVar(value=self.cfg.get("auto_display", True))
+        chk_auto = tk.Checkbutton(
+            right_col, text="Instant Screen Display (Zero-Confirmation Auto-Popup)", variable=self.var_autodisplay,
+            bg="#161b22", fg="#c9d1d9", selectcolor="#0d1117", activebackground="#161b22",
+            command=self.save_settings
+        )
+        chk_auto.pack(anchor=tk.W, padx=15, pady=2)
+
+        dz_frame = tk.Frame(right_col, bg="#161b22")
+        dz_frame.pack(fill=tk.X, padx=15, pady=2)
+        tk.Label(dz_frame, text="DropZone:", font=("Segoe UI", 8), bg="#161b22", fg="#8b949e").pack(side=tk.LEFT)
+        self.entry_dz = tk.Entry(dz_frame, bg="#0d1117", fg="#c9d1d9", insertbackground="#58a6ff", relief="flat")
+        self.entry_dz.insert(0, self.cfg.get("dropzone", DEFAULT_DROPZONE))
+        self.entry_dz.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        btn_browse = tk.Button(dz_frame, text="📂", bg="#30363d", fg="white", relief="flat", command=self.browse_dropzone)
+        btn_browse.pack(side=tk.LEFT)
+
+        # 4. Activity Log
+        tk.Label(right_col, text="Activity Log / Recent Beams:", font=("Segoe UI", 8, "bold"), bg="#161b22", fg="#8b949e").pack(anchor=tk.W, padx=15, pady=(4, 2))
+        self.txt_log = tk.Text(right_col, height=6, bg="#0d1117", fg="#7ee787", font=("Consolas", 8), relief="flat")
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 8))
+
+        # Populate COM ports
+        self.refresh_serial_ports()
 
     def log(self, msg):
         timestamp = time.strftime("%H:%M:%S")
         self.txt_log.insert(tk.END, f"[{timestamp}] {msg}\n")
         self.txt_log.see(tk.END)
+
+    def on_layout_change(self, event=None):
+        val = self.combo_layout.get()
+        layout_key = "opposite" if "Opposite" in val else "side_by_side"
+        self.cfg["desk_layout"] = layout_key
+        self.cfg_mgr.save()
+        self.log(f"📐 Desk Geometry set to: {val}")
 
     def browse_dropzone(self):
         folder = filedialog.askdirectory(initialdir=self.entry_dz.get())
@@ -465,6 +690,14 @@ class CosmicLinkApp:
             self.entry_dz.delete(0, tk.END)
             self.entry_dz.insert(0, folder)
             self.save_settings()
+
+    def update_pairing_key(self):
+        new_key = self.entry_key.get().strip()
+        if new_key:
+            self.cfg["pairing_key"] = new_key
+            self.cfg_mgr.save()
+            self.lbl_status.config(text=f"IP: {self.local_ip}  |  Pairing Key: {new_key}")
+            self.log(f"🔑 Pairing Key updated to '{new_key}'.")
 
     def save_settings(self):
         self.cfg["auto_display"] = self.var_autodisplay.get()
@@ -474,7 +707,130 @@ class CosmicLinkApp:
         self.cfg_mgr.save()
 
     # -------------------------------------------------------------------------
-    # SPATIAL LOGIC & TARGET LOCKING
+    # SERIAL PORT & HARDWARE ACTIONS
+    # -------------------------------------------------------------------------
+    def refresh_serial_ports(self):
+        ports = self.esp_bridge.list_ports()
+        self.combo_ports["values"] = ports
+        if ports:
+            if not self.combo_ports.get() or self.combo_ports.get() not in ports:
+                self.combo_ports.current(0)
+        else:
+            self.combo_ports.set("No Ports")
+
+    def auto_connect_serial(self):
+        ports = self.esp_bridge.list_ports()
+        if ports:
+            target_port = self.cfg.get("serial_port", "")
+            if target_port not in ports:
+                target_port = ports[0]
+            self.combo_ports.set(target_port)
+            if self.esp_bridge.connect(target_port):
+                self.btn_serial_connect.config(text="Disconnect", bg="#b62324")
+                self.cfg["serial_port"] = target_port
+                self.cfg_mgr.save()
+
+    def toggle_serial_connection(self):
+        if self.esp_bridge.ser and self.esp_bridge.ser.is_open:
+            self.esp_bridge.disconnect()
+            self.btn_serial_connect.config(text="Connect", bg="#238636")
+            self.lbl_hw_status.config(text="STATUS: Disconnected", fg="#8b949e")
+        else:
+            port = self.combo_ports.get()
+            if not port or port == "No Ports":
+                messagebox.showwarning("Serial Connection", "No COM port selected!\nPlug in the ESP32 via USB and click Refresh.")
+                return
+            if self.esp_bridge.connect(port):
+                self.btn_serial_connect.config(text="Disconnect", bg="#b62324")
+                self.lbl_hw_status.config(text="STATUS: 🟢 Ready (Live Active)", fg="#7ee787")
+                self.cfg["serial_port"] = port
+                self.cfg_mgr.save()
+            else:
+                messagebox.showerror("Serial Connection", f"Could not open {port}.\nMake sure Arduino Serial Monitor is closed.")
+
+    def freeze_mouse_for_tuning(self):
+        """Freezes air mouse so the user can adjust sliders without cursor jumps."""
+        if not (self.esp_bridge.ser and self.esp_bridge.ser.is_open):
+            port = self.combo_ports.get()
+            if port and port != "No Ports":
+                self.esp_bridge.connect(port)
+
+        if self.esp_bridge.ser and self.esp_bridge.ser.is_open:
+            self.esp_bridge.freeze_mouse()
+            self.lbl_hw_status.config(
+                text="STATUS: ❄️ MOUSE FROZEN (Safe to adjust sliders)",
+                fg="#f0883e",
+                bg="#2d1b00"
+            )
+            self.hud.show("❄️ AIR MOUSE FROZEN FOR TUNING", status="ready")
+            self.hud.auto_hide(2000)
+        else:
+            self.lbl_hw_status.config(
+                text="STATUS: ⚠️ Local Mode (ESP32 USB not connected)",
+                fg="#d29922"
+            )
+            self.log("[NOTE] ESP32 not connected over USB. Connect USB cable to freeze hardware.")
+
+    def unfreeze_mouse_manual(self):
+        self.esp_bridge.unfreeze_mouse()
+        self.lbl_hw_status.config(
+            text="STATUS: 🟢 Ready (Live Active)",
+            fg="#7ee787",
+            bg="#0d1117"
+        )
+        self.hud.show("🟢 AIR MOUSE ACTIVE", status="ready")
+        self.hud.auto_hide(1200)
+
+    def confirm_and_calibrate(self):
+        """User confirmation to flash settings to ESP32 Flash and calibrate gyro."""
+        sens = float(self.slider_sens.get())
+        smooth = float(self.slider_smooth.get())
+
+        answer = messagebox.askyesno(
+            "Confirm Air Mouse Calibration",
+            f"Apply settings to ESP32?\n\n"
+            f"• Sensitivity: {sens:.2f}\n"
+            f"• Smoothing: {smooth:.2f}\n\n"
+            f"Keep the Air Mouse completely flat and still for 2 seconds while gyro calibrates.\n\n"
+            f"Proceed now?"
+        )
+        if not answer:
+            return
+
+        self.save_settings()
+
+        if self.esp_bridge.ser and self.esp_bridge.ser.is_open:
+            self.lbl_hw_status.config(
+                text="STATUS: ⏳ Calibrating Gyro (Keep mouse still!)...",
+                fg="#58a6ff",
+                bg="#0b1b36"
+            )
+            self.hud.show("⏳ CALIBRATING GYRO (KEEP STILL!)...", status="ready")
+
+            def run_cal():
+                self.esp_bridge.calibrate_and_apply(sens, smooth)
+                time.sleep(1.8)
+                self.root.after(0, self._on_cal_complete)
+
+            threading.Thread(target=run_cal, daemon=True).start()
+        else:
+            self.log(f"Settings saved locally. Connect ESP32 USB to flash to hardware memory.")
+            self.recenter_zero()
+            messagebox.showinfo("Cosmic Link", "Settings saved locally!\nConnect ESP32 via USB if you wish to write directly to hardware Flash memory.")
+
+    def _on_cal_complete(self):
+        self.recenter_zero()
+        self.lbl_hw_status.config(
+            text="STATUS: 🟢 Calibrated & Unfrozen (Ready)",
+            fg="#7ee787",
+            bg="#0d1117"
+        )
+        self.hud.show("✔ CALIBRATED & UNFROZEN!", status="locked")
+        self.hud.auto_hide(2000)
+        self.log("✔ Gyro calibration complete. Air Mouse unfrozen and ready to fly!")
+
+    # -------------------------------------------------------------------------
+    # SPATIAL LOGIC & BIDIRECTIONAL RADAR SYNC
     # -------------------------------------------------------------------------
     def recenter_zero(self):
         """Snaps current direction as 0° Forward."""
@@ -484,6 +840,57 @@ class CosmicLinkApp:
 
     def calculate_relative_heading(self, raw_yaw):
         return (raw_yaw - self.zero_offset + 360) % 360
+
+    def lock_heading_to_device(self):
+        """Locks the current air mouse aim angle for the selected laptop,
+
+        and automatically transmits the reciprocal angle over Wi-Fi so
+        the target laptop immediately knows this laptop's location!
+        """
+        if not self.cfg["devices"]:
+            messagebox.showinfo("Lock Angle", "No peer laptops discovered yet on your Wi-Fi.\nStart cosmic.py on your other laptop to connect.")
+            return
+
+        target_name = self.radar.selected_blip or list(self.cfg["devices"].keys())[0]
+        heading = self.calculate_relative_heading(self.current_yaw)
+        self.cfg["devices"][target_name]["angle"] = round(heading, 1)
+        self.cfg_mgr.save()
+        self.radar.set_devices(self.cfg["devices"])
+
+        self.log(f"📍 Locked {target_name} at {heading:.1f}°")
+        self.hud.show(f"📍 {target_name.upper()} LOCKED AT {int(heading)}°", status="locked")
+        self.hud.auto_hide(2000)
+
+        # Synchronize location with target laptop over Wi-Fi
+        target_info = self.cfg["devices"].get(target_name)
+        if target_info and target_info.get("ip"):
+            threading.Thread(
+                target=self.send_location_sync,
+                args=(target_info["ip"], target_name, heading),
+                daemon=True
+            ).start()
+
+    def send_location_sync(self, target_ip, target_name, heading):
+        """Sends location sync packet to peer laptop so it automatically positions this laptop on its radar."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(4.0)
+            sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
+
+            sync_packet = {
+                "type": "SYNC_RADAR_LOCATION",
+                "key": self.cfg["pairing_key"],
+                "sender": self.cfg["device_name"],
+                "angle_from_sender": heading,
+                "desk_layout": self.cfg.get("desk_layout", "side_by_side")
+            }
+            payload = json.dumps(sync_packet).encode("utf-8")
+            sock.sendall(struct.pack(">I", len(payload)))
+            sock.sendall(payload)
+            sock.close()
+            self.root.after(0, lambda: self.log(f"📡 Synchronized spatial coordinates to {target_name} ({target_ip})!"))
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"[!] Could not sync radar location to {target_name}: {e}"))
 
     def evaluate_target_lock(self):
         """Finds if current aim is pointing at any paired laptop (within ±25°)."""
@@ -506,34 +913,41 @@ class CosmicLinkApp:
     # HARDWARE & MOUSE GESTURE HOOKS
     # -------------------------------------------------------------------------
     def init_spatial_listener(self):
-        """Hooks into mouse / gestures or hotkey to trigger Hold-to-Beam."""
+        """Hooks into mouse to handle Button 3 hold for spatial move & screen edge wrapping."""
         if not mouse or not keyboard:
-            self.log("[!] pynput not available - use 'Test Beam' button.")
+            self.log("[!] pynput not available - use 'Beam Staged Payload' button.")
             return
 
         self.last_btn3_press = 0.0
-        self.last_mouse_x = None
+        self.mouse_controller = mouse.Controller()
 
         def on_move(x, y):
             if self.last_mouse_x is not None:
                 dx = x - self.last_mouse_x
-                # Real-time heading update from Air Mouse motion
                 yaw_delta = dx * 0.30
                 self.current_yaw = (self.current_yaw + yaw_delta) % 360
+
+                # Screen edge warp while holding beam so aiming never traps at monitor edge
+                if self.is_holding_beam:
+                    try:
+                        sw = self.root.winfo_screenwidth()
+                        sh = self.root.winfo_screenheight()
+                        if x < 40 or x > sw - 40:
+                            cx = sw // 2
+                            cy = sh // 2
+                            self.mouse_controller.position = (cx, cy)
+                            self.last_mouse_x = cx
+                            return
+                    except Exception:
+                        pass
+
             self.last_mouse_x = x
 
         def on_click(x, y, button, pressed):
-            # Middle button (or Button 3 on Air Mouse) triggers Spatial Beam
+            # Middle button (sent by ESP32 on Button 3 hold)
             if button == mouse.Button.middle:
                 now = time.time()
                 if pressed:
-                    if now - self.last_btn3_press < 0.35:
-                        self.root.after(0, self.recenter_zero)
-                        self.hud.show("🎯 RE-CENTERED TO 0°", status="ready")
-                        self.hud.auto_hide(1200)
-                        self.is_holding_beam = False
-                        self.last_btn3_press = 0.0
-                        return
                     self.last_btn3_press = now
                     self.is_holding_beam = True
                     self.root.after(0, self.on_beam_hold_start)
@@ -547,27 +961,15 @@ class CosmicLinkApp:
         listener.start()
 
     def on_beam_hold_start(self):
-        if self.pairing_pending_device:
-            dev_name = self.pairing_pending_device
-            heading = self.calculate_relative_heading(self.current_yaw)
-            self.cfg["devices"][dev_name]["angle"] = round(heading, 1)
-            self.cfg_mgr.save()
-            self.radar.set_devices(self.cfg["devices"])
-            self.log(f"✔ PAIRED: {dev_name} locked at {heading:.1f}°!")
-            self.hud.show(f"✔ PAIRED: {dev_name} AT {int(heading)}°", status="locked")
-            self.hud.auto_hide(2000)
-            self.pairing_pending_device = None
-            return
-
         # Check staged file payload
         try:
-            fname, _, _ = self.get_staged_payload()
-            if "screenshot" in fname:
+            fname, _, _, ptype = self.get_staged_payload()
+            if ptype == "screenshot":
                 status_text = "⚡ READY TO SEND [Screenshot]"
             else:
                 status_text = f"⚡ READY TO SEND [{fname}]"
         except Exception:
-            status_text = "⚡ READY TO SEND [Aiming...]"
+            status_text = "⚡ READY TO SEND [Aim at Target Laptop...]"
 
         self.hud.show(status_text, status="ready")
 
@@ -577,7 +979,7 @@ class CosmicLinkApp:
             if target_info:
                 self.hud.show(f"✔ SENT TO {self.target_locked.upper()}!", status="sent")
                 self.log(f"🚀 Beaming payload to {self.target_locked} ({target_info['ip']})...")
-                threading.Thread(target=self.transmit_payload, args=(target_info["ip"],), daemon=True).start()
+                threading.Thread(target=self.transmit_payload, args=(target_info["ip"], self.target_locked), daemon=True).start()
         else:
             self.hud.hide()
 
@@ -585,30 +987,29 @@ class CosmicLinkApp:
         """Allows testing without physical mouse hardware."""
         heading = self.calculate_relative_heading(self.current_yaw)
         self.evaluate_target_lock()
-        if self.target_locked:
-            target_info = self.cfg["devices"][self.target_locked]
-            self.hud.show(f"✔ BEAMED TO {self.target_locked.upper()}!", status="sent")
-            threading.Thread(target=self.transmit_payload, args=(target_info["ip"],), daemon=True).start()
-        elif self.cfg["devices"]:
-            first_name = list(self.cfg["devices"].keys())[0]
-            target_info = self.cfg["devices"][first_name]
-            self.hud.show(f"✔ BEAMED TO {first_name.upper()}!", status="sent")
-            threading.Thread(target=self.transmit_payload, args=(target_info["ip"],), daemon=True).start()
+        target_name = self.target_locked
+        if not target_name and self.cfg["devices"]:
+            target_name = list(self.cfg["devices"].keys())[0]
+
+        if target_name:
+            target_info = self.cfg["devices"][target_name]
+            self.hud.show(f"✔ BEAMED TO {target_name.upper()}!", status="sent")
+            threading.Thread(target=self.transmit_payload, args=(target_info["ip"], target_name), daemon=True).start()
         else:
             messagebox.showinfo("Cosmic Link", "No nearby laptops discovered yet!\nOpen Cosmic Link on another laptop on your Wi-Fi.")
 
     # -------------------------------------------------------------------------
-    # NETWORKING: PEER-TO-PEER BEACON DISCOVERY
+    # NETWORKING: PEER DISCOVERY & MUTUAL PAIRING CONFIRMATION
     # -------------------------------------------------------------------------
     def udp_beacon_broadcaster(self):
         """Whispers presence on local Wi-Fi with Pairing Key."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        my_name = self.cfg["device_name"]
-        key = self.cfg["pairing_key"]
 
         while self.running:
             try:
+                my_name = self.cfg["device_name"]
+                key = self.cfg["pairing_key"]
                 msg = f"COSMIC:{key}:{my_name}:{self.local_ip}".encode("utf-8")
                 sock.sendto(msg, ("<broadcast>", DEFAULT_DISCOVERY_PORT))
             except Exception:
@@ -616,7 +1017,7 @@ class CosmicLinkApp:
             time.sleep(2.0)
 
     def udp_beacon_listener(self):
-        """Hears whispers from other laptops on Wi-Fi."""
+        """Hears whispers from other laptops on Wi-Fi and triggers pairing confirmation."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -635,33 +1036,81 @@ class CosmicLinkApp:
                     dev_name   = parts[2]
                     dev_ip     = parts[3]
 
+                    # Must match pairing key and not be this computer
                     if beacon_key != self.cfg["pairing_key"] or dev_name == self.cfg["device_name"]:
                         continue
 
                     now = time.time()
-                    if dev_name not in self.cfg["devices"]:
-                        self.cfg["devices"][dev_name] = {
-                            "ip": dev_ip,
-                            "angle": 45.0,
-                            "last_seen": now
-                        }
-                        self.cfg_mgr.save()
-                        self.radar.set_devices(self.cfg["devices"])
-                        self.pairing_pending_device = dev_name
-                        self.root.after(0, lambda: self.log(f"★ NEW DEVICE: '{dev_name}'! Aim at it and click Button 3 to lock location."))
-                        self.root.after(0, lambda: self.hud.show(f"AIM AT {dev_name.upper()} & CLICK BUTTON 3 TO PAIR", status="ready"))
-                    else:
+                    # Check if already paired and trusted
+                    if dev_name in self.cfg["devices"] and self.cfg["devices"][dev_name].get("trusted", False):
                         self.cfg["devices"][dev_name]["ip"] = dev_ip
                         self.cfg["devices"][dev_name]["last_seen"] = now
+                        continue
+
+                    # If not yet trusted, prompt for pairing confirmation with key
+                    if dev_name not in self.pending_pairings:
+                        self.pending_pairings.add(dev_name)
+                        self.root.after(0, lambda d=dev_name, ip=dev_ip: self.prompt_pair_confirmation(d, ip))
             except Exception:
                 pass
 
+    def prompt_pair_confirmation(self, dev_name, dev_ip):
+        """Asks the user on this laptop to confirm pairing with the incoming device."""
+        key = self.cfg["pairing_key"]
+        ans = messagebox.askyesno(
+            "Cosmic Link - New Device Discovered",
+            f"Device '{dev_name}' ({dev_ip}) detected on local Wi-Fi.\n"
+            f"Matching Pairing Key: '{key}'.\n\n"
+            f"Do you want to accept pairing and establish mutual trust with '{dev_name}'?",
+            parent=self.root
+        )
+        if ans:
+            existing_count = len(self.cfg["devices"])
+            default_ang = (45.0 + existing_count * 60.0) % 360.0
+
+            self.cfg["devices"][dev_name] = {
+                "ip": dev_ip,
+                "angle": round(default_ang, 1),
+                "last_seen": time.time(),
+                "trusted": True
+            }
+            self.cfg_mgr.save()
+            self.radar.set_devices(self.cfg["devices"])
+
+            self.log(f"★ TRUST ESTABLISHED with '{dev_name}' ({dev_ip})!")
+            self.hud.show(f"✔ PAIRED WITH {dev_name.upper()}! POINT & SYNC", status="locked")
+            self.hud.auto_hide(3000)
+
+            # Send a TCP Pair Accept packet back to the peer so it trusts us too
+            threading.Thread(target=self.send_pair_accept, args=(dev_ip,), daemon=True).start()
+        else:
+            self.log(f"✖ Pairing with '{dev_name}' was declined.")
+
+        self.pending_pairings.discard(dev_name)
+
+    def send_pair_accept(self, target_ip):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(4.0)
+            sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
+            packet = {
+                "type": "PAIR_ACCEPT",
+                "key": self.cfg["pairing_key"],
+                "sender": self.cfg["device_name"]
+            }
+            payload = json.dumps(packet).encode("utf-8")
+            sock.sendall(struct.pack(">I", len(payload)))
+            sock.sendall(payload)
+            sock.close()
+        except Exception:
+            pass
+
     # -------------------------------------------------------------------------
-    # NETWORKING: HIGH-SPEED TCP ZERO-CONFIRMATION BEAM ENGINE
+    # NETWORKING: HIGH-SPEED TCP BEAM ENGINE & CONTROL PACKETS
     # -------------------------------------------------------------------------
     def get_staged_payload(self):
         """Grabs the file right-clicked/selected in Explorer, clipboard, or screenshot."""
-        # 1. Check if a file is right-clicked / selected in Windows File Explorer
+        # 1. Check if a file is selected/right-clicked in Windows File Explorer
         try:
             import win32com.client
             shell = win32com.client.Dispatch("Shell.Application")
@@ -673,13 +1122,13 @@ class CosmicLinkApp:
                         if os.path.isfile(selected_path):
                             fname = os.path.basename(selected_path)
                             fsize = os.path.getsize(selected_path)
-                            return fname, selected_path, fsize
+                            return fname, selected_path, fsize, "file"
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # 2. Check if a file was copied to clipboard in Windows Explorer (CF_HDROP)
+        # 2. Check if a file was copied in Windows Explorer (CF_HDROP)
         try:
             import win32clipboard
             win32clipboard.OpenClipboard()
@@ -690,7 +1139,7 @@ class CosmicLinkApp:
                     selected_path = file_list[0]
                     fname = os.path.basename(selected_path)
                     fsize = os.path.getsize(selected_path)
-                    return fname, selected_path, fsize
+                    return fname, selected_path, fsize, "file"
             else:
                 win32clipboard.CloseClipboard()
         except Exception:
@@ -706,41 +1155,46 @@ class CosmicLinkApp:
             if cb and os.path.isfile(cb):
                 fname = os.path.basename(cb)
                 fsize = os.path.getsize(cb)
-                return fname, cb, fsize
+                return fname, cb, fsize, "file"
         except Exception:
             pass
 
-        # 2. Fallback: High-resolution full screen capture
+        # 4. Fallback: High-resolution full screen capture
         fname = f"screenshot_{int(time.time())}.jpg"
         if ImageGrab:
             img = ImageGrab.grab()
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
             data = buf.getvalue()
-            return fname, data, len(data)
+            return fname, data, len(data), "screenshot"
 
         # Fallback text test
         data = b"COSMIC_BEAM_PAYLOAD"
-        return "beam.txt", data, len(data)
+        return "beam.txt", data, len(data), "text"
 
-    def transmit_payload(self, target_ip):
+    def transmit_payload(self, target_ip, target_name="Target"):
         """Streams payload (file or screenshot) over TCP in 64KB chunks."""
         t_start = time.time()
         try:
-            fname, payload_src, fsize = self.get_staged_payload()
+            fname, payload_src, fsize, _ = self.get_staged_payload()
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
+            sock.settimeout(6.0)
             sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
 
-            # Send JSON Header: {"name": ..., "size": ...}
-            hdr_bytes = json.dumps({"name": fname, "size": fsize}).encode("utf-8")
+            header_dict = {
+                "type": "FILE_TRANSFER",
+                "key": self.cfg["pairing_key"],
+                "sender": self.cfg["device_name"],
+                "name": fname,
+                "size": fsize
+            }
+            hdr_bytes = json.dumps(header_dict).encode("utf-8")
             sock.sendall(struct.pack(">I", len(hdr_bytes)))
             sock.sendall(hdr_bytes)
 
             # Stream payload data
             if isinstance(payload_src, str):
-                # It's a file path on disk
                 with open(payload_src, "rb") as f:
                     while True:
                         chunk = f.read(65536)
@@ -748,17 +1202,16 @@ class CosmicLinkApp:
                             break
                         sock.sendall(chunk)
             else:
-                # It's bytes in memory
                 sock.sendall(payload_src)
 
             sock.close()
             elapsed = time.time() - t_start
-            self.root.after(0, lambda: self.log(f"✔ Sent '{fname}' ({fsize} bytes) in {elapsed:.3f}s!"))
+            self.root.after(0, lambda: self.log(f"✔ Beamed '{fname}' ({fsize} bytes) to {target_name} in {elapsed:.3f}s!"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"[!] Transmission failed: {e}"))
 
     def tcp_receiver_server(self):
-        """Receives incoming beamed files and displays instantly with ZERO prompt."""
+        """Receives incoming beamed files & control packets, displaying media instantly with ZERO prompt."""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -779,7 +1232,83 @@ class CosmicLinkApp:
                 hdr_data = conn.recv(hdr_len).decode("utf-8")
                 hdr = json.loads(hdr_data)
 
-                fname = hdr.get("name", f"beam_{int(time.time())}.dat")
+                # Verify Pairing Key
+                received_key = hdr.get("key", "")
+                if received_key != self.cfg["pairing_key"]:
+                    print(f"[SECURITY] Rejected packet from {addr[0]} - Invalid Pairing Key!")
+                    conn.close()
+                    continue
+
+                msg_type = hdr.get("type", "FILE_TRANSFER")
+                sender_name = hdr.get("sender", addr[0])
+
+                # -------------------------------------------------------------
+                # 1. CONTROL: SYNC RADAR LOCATION FROM PEER
+                # -------------------------------------------------------------
+                if msg_type == "SYNC_RADAR_LOCATION":
+                    angle_from_sender = hdr.get("angle_from_sender", 0.0)
+                    desk_layout = hdr.get("desk_layout", self.cfg.get("desk_layout", "side_by_side"))
+
+                    # Compute reciprocal angle for this laptop:
+                    # - Side-by-side (facing user): if B is to A's right (+45°), A is to B's left (-45° = 315°)
+                    # - Opposite (across table): if A is at θ, B is at θ + 180°
+                    if desk_layout == "opposite":
+                        reciprocal_angle = (angle_from_sender + 180.0) % 360.0
+                    else:
+                        reciprocal_angle = (360.0 - angle_from_sender) % 360.0
+
+                    if sender_name not in self.cfg["devices"]:
+                        self.cfg["devices"][sender_name] = {
+                            "ip": addr[0],
+                            "angle": round(reciprocal_angle, 1),
+                            "last_seen": time.time(),
+                            "trusted": True
+                        }
+                    else:
+                        self.cfg["devices"][sender_name]["angle"] = round(reciprocal_angle, 1)
+                        self.cfg["devices"][sender_name]["ip"] = addr[0]
+                        self.cfg["devices"][sender_name]["trusted"] = True
+
+                    self.cfg_mgr.save()
+                    self.root.after(0, lambda: self.radar.set_devices(self.cfg["devices"]))
+                    self.root.after(0, lambda: self.log(
+                        f"📍 RADAR AUTO-SYNCED: {sender_name} located at {reciprocal_angle:.1f}° (computed reciprocal from {sender_name})"
+                    ))
+                    self.root.after(0, lambda: self.hud.show(
+                        f"📍 SYNCED: {sender_name.upper()} AT {int(reciprocal_angle)}°", status="locked"
+                    ))
+                    self.root.after(0, lambda: self.hud.auto_hide(2500))
+                    conn.close()
+                    continue
+
+                # -------------------------------------------------------------
+                # 2. CONTROL: PAIR ACCEPT FROM PEER
+                # -------------------------------------------------------------
+                if msg_type == "PAIR_ACCEPT":
+                    if sender_name not in self.cfg["devices"]:
+                        self.cfg["devices"][sender_name] = {
+                            "ip": addr[0],
+                            "angle": 45.0,
+                            "last_seen": time.time(),
+                            "trusted": True
+                        }
+                    else:
+                        self.cfg["devices"][sender_name]["trusted"] = True
+                        self.cfg["devices"][sender_name]["ip"] = addr[0]
+
+                    self.cfg_mgr.save()
+                    self.root.after(0, lambda: self.radar.set_devices(self.cfg["devices"]))
+                    self.root.after(0, lambda: self.log(f"★ PAIRING CONFIRMED: '{sender_name}' accepted trust!"))
+                    self.root.after(0, lambda: self.hud.show(f"✔ {sender_name.upper()} ACCEPTED PAIRING!", status="locked"))
+                    self.root.after(0, lambda: self.hud.auto_hide(2500))
+                    conn.close()
+                    continue
+
+                # -------------------------------------------------------------
+                # 3. FILE TRANSFER: RECEIVE & ZERO-CONFIRMATION AUTO-POPUP
+                # -------------------------------------------------------------
+                raw_fname = hdr.get("name", f"beam_{int(time.time())}.dat")
+                fname = os.path.basename(raw_fname)
                 fsize = hdr.get("size", 0)
 
                 drop_folder = self.cfg.get("dropzone", DEFAULT_DROPZONE)
@@ -798,8 +1327,11 @@ class CosmicLinkApp:
 
                 conn.close()
 
-                # Launch immediately on screen
-                self.root.after(0, lambda: self.log(f"⚡ RECEIVED: '{fname}' ({received_bytes} bytes) from {addr[0]}"))
+                # Launch immediately on screen with auto-display
+                self.root.after(0, lambda: self.log(f"⚡ RECEIVED: '{fname}' ({received_bytes} bytes) from {sender_name} ({addr[0]})"))
+                self.root.after(0, lambda: self.hud.show(f"⚡ RECEIVED: {fname} (OPENING NOW!)", status="locked"))
+                self.root.after(0, lambda: self.hud.auto_hide(2500))
+
                 if self.cfg.get("auto_display", True):
                     try:
                         os.startfile(filepath)
@@ -819,8 +1351,8 @@ class CosmicLinkApp:
                 self.hud.show(f"🎯 TARGET LOCKED: {target.upper()} (Release to Beam)", status="locked")
             else:
                 try:
-                    fname, _, _ = self.get_staged_payload()
-                    target_label = f"[{fname}]" if "screenshot" not in fname else "[Screenshot]"
+                    fname, _, _, ptype = self.get_staged_payload()
+                    target_label = f"[{fname}]" if ptype != "screenshot" else "[Screenshot]"
                 except Exception:
                     target_label = "[Aiming...]"
                 self.hud.show(f"⚡ READY TO SEND {target_label} ({int(heading)}°)", status="ready")
@@ -831,6 +1363,8 @@ class CosmicLinkApp:
 
     def on_close(self):
         self.running = False
+        if self.esp_bridge:
+            self.esp_bridge.disconnect()
         self.cfg_mgr.save()
         self.root.destroy()
 

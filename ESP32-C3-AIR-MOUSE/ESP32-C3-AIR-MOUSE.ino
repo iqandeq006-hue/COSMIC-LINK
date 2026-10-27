@@ -28,6 +28,10 @@
 #include <MPU6050_tockn.h>
 #include <HijelHID_BLEMouse.h>
 #include <Preferences.h>
+#include <esp_system.h>
+#if __has_include(<esp_mac.h>)
+  #include <esp_mac.h>
+#endif
 
 // -----------------------------------------------------------------------------
 // HARDWARE PINS
@@ -63,14 +67,16 @@ float fX = 0;
 float fY = 0;
 
 // Button State Tracking
-unsigned long leftPressStart  = 0;
-unsigned long rightPressStart = 0;
-unsigned long starkPressStart = 0;
-unsigned long lastStarkClick  = 0;
+unsigned long leftPressStart    = 0;
+unsigned long rightPressStart   = 0;
+unsigned long starkPressStart   = 0;
+unsigned long lastStarkRelease  = 0;
+bool pendingStarkClick          = false;
 
 bool leftHeld  = false;
 bool rightHeld = false;
 bool starkHeld = false;
+bool isFrozen  = false;  // Frozen during desktop app tuning
 
 const unsigned long clickThreshold = 180;
 const unsigned long holdThreshold  = 400;
@@ -90,6 +96,10 @@ void loadPreferences() {
   activeSlot  = prefs.getInt("slot", 1);
   prefs.end();
 
+  if (activeSlot != 1 && activeSlot != 2) {
+    activeSlot = 1;
+  }
+
   Serial.println("\n[CONFIG] Loaded settings from Flash:");
   Serial.printf("  Sensitivity: %.2f | Smoothing: %.2f | Deadzone: %d | Profile Slot: %d\n\n",
                 sensitivity, smoothing, deadzone, activeSlot);
@@ -98,6 +108,12 @@ void loadPreferences() {
 void saveSetting(const char* key, float val) {
   prefs.begin("airmouse", false);
   prefs.putFloat(key, val);
+  prefs.end();
+}
+
+void saveSettingInt(const char* key, int val) {
+  prefs.begin("airmouse", false);
+  prefs.putInt(key, val);
   prefs.end();
 }
 
@@ -129,13 +145,13 @@ void calibrateGyro() {
 
 // =============================================================================
 // BLE PROFILE MANAGEMENT (Slot 1 <-> Slot 2)
-// Re-instantiates mouse dynamically to avoid 'setDeviceName' compiler errors
-// on all versions of HijelBLEMouse / BleMouse.
+// Re-instantiates mouse dynamically with dedicated MAC address and device name
+// so Laptop A and Laptop B are treated as two distinct Bluetooth devices.
 // =============================================================================
 void applyProfileSlot(int slot) {
   if (mouse != nullptr) {
     mouse->end();
-    delay(250);
+    delay(100);
     delete mouse;
     mouse = nullptr;
   }
@@ -151,6 +167,30 @@ void applyProfileSlot(int slot) {
   mouse->setBatteryLevel(100);
   mouse->setLogLevel(HIDLogLevel::Normal);
   mouse->begin();
+
+  uint8_t curMac[6];
+  if (esp_read_mac(curMac, ESP_MAC_BT) == ESP_OK) {
+    Serial.printf("[BLE] Active Bluetooth MAC: %02X:%02X:%02X:%02X:%02X:%02X\n\n",
+                  curMac[0], curMac[1], curMac[2], curMac[3], curMac[4], curMac[5]);
+  }
+}
+
+// Switches slot, saves to Flash, and reboots ESP32 cleanly to activate
+// the dedicated hardware MAC address for the target laptop.
+void switchProfileSlot(int newSlot) {
+  Serial.println("\n----------------------------------------");
+  Serial.printf("[BLE] Switching to Profile Slot %d...\n", newSlot);
+  saveSettingInt("slot", newSlot);
+
+  if (mouse != nullptr) {
+    mouse->end();
+    delay(100);
+  }
+
+  Serial.println("[BLE] Restarting ESP32 to activate dedicated hardware MAC address...");
+  Serial.println("----------------------------------------\n");
+  delay(150);
+  ESP.restart();
 }
 
 
@@ -165,8 +205,22 @@ void setup() {
   Serial.println("     COMET AIR MOUSE - STARK EDITION    ");
   Serial.println("========================================");
 
-  // Load preferences from flash
+  // 1. Load preferences from flash first
   loadPreferences();
+
+  // 2. Configure unique hardware MAC address for the active profile slot.
+  // CRITICAL: Must be called BEFORE BLEDevice::init() / mouse->begin().
+  // Slot 1 uses factory base MAC (Laptop A).
+  // Slot 2 uses modified base MAC (Laptop B).
+  // Because the MAC addresses are different, Laptop A will NOT auto-connect
+  // or hijack the connection when Slot 2 is active!
+  uint8_t baseMac[6];
+  if (esp_efuse_mac_get_default(baseMac) == ESP_OK) {
+    if (activeSlot == 2) {
+      baseMac[4] ^= 0x02; // Change byte 4 for Slot 2
+    }
+    esp_base_mac_addr_set(baseMac);
+  }
 
   // Pin Configuration
   pinMode(LEFT_BUTTON,  INPUT_PULLUP);
@@ -182,7 +236,7 @@ void setup() {
   mpu6050.calcGyroOffsets(true);
   calibrateGyro();
 
-  // BLE HID Setup with active profile slot
+  // BLE HID Setup with active profile slot & dedicated MAC
   applyProfileSlot(activeSlot);
 
   Serial.println("BLE Started. Waiting for connection...");
@@ -214,6 +268,31 @@ void checkSerialCommands() {
       fY = 0;
       Serial.println("[RECENTER] Recenter forward acknowledged.");
     }
+    else if (line.startsWith("FREEZE")) {
+      isFrozen = true;
+      Serial.println("[FREEZE] Air Mouse movement frozen for desktop tuning.");
+    }
+    else if (line.startsWith("UNFREEZE")) {
+      isFrozen = false;
+      Serial.println("[UNFREEZE] Air Mouse unfrozen.");
+    }
+    else if (line.startsWith("CALIBRATE")) {
+      Serial.println("[CALIBRATE] Calibrating Gyro (Keep Still!)...");
+      calibrateGyro();
+      fX = 0;
+      fY = 0;
+      isFrozen = false;
+      Serial.println("[CALIBRATE_OK] Gyro calibrated and mouse unfrozen!");
+    }
+    else if (line.startsWith("SLOT:")) {
+      int s = line.substring(5).toInt();
+      if (s == 1 || s == 2) {
+        switchProfileSlot(s);
+      }
+    }
+    else if (line.equalsIgnoreCase("TOGGLE")) {
+      switchProfileSlot((activeSlot == 1) ? 2 : 1);
+    }
   }
 }
 
@@ -223,6 +302,13 @@ void checkSerialCommands() {
 // =============================================================================
 void loop() {
   checkSerialCommands();
+
+  // If frozen for live desktop tuning, halt all motion and button output
+  if (isFrozen) {
+    delay(20);
+    return;
+  }
+
   mpu6050.update();
 
   unsigned long now = millis();
@@ -280,9 +366,9 @@ void loop() {
 
   // ---------------------------------------------------------------------------
   // BUTTON 3: MULTI-FUNCTION "STARK" BUTTON (GPIO 23)
-  // Double-Click: Recenter
-  // Hold: Spatial Grab Mode (Middle Mouse Down for Comet Link app)
-  // Short Click: Switch Bluetooth Profile (Slot 1 <-> Slot 2)
+  // Double-Click (<350ms): Recenter Forward (0°)
+  // Hold (>400ms): Spatial Grab Mode (Middle Mouse Down for Cosmic Link app)
+  // Single-Click: Switch Bluetooth Profile (Slot 1 <-> Slot 2)
   // ---------------------------------------------------------------------------
   if (digitalRead(STARK_BUTTON) == LOW) {
     if (starkPressStart == 0) {
@@ -292,15 +378,14 @@ void loop() {
     // Hold Threshold Reached -> Enter Stark Spatial Grab Mode!
     if (!starkHeld && (now - starkPressStart >= holdThreshold)) {
       starkHeld = true;
+      pendingStarkClick = false; // Cancel pending click on hold
       if (paired) {
-        mouse->press(MouseButton::Middle);  // Signals Comet Link overlay
+        mouse->press(MouseButton::Middle);  // Signals Cosmic Link overlay
         Serial.println("[STARK] Spatial Grab Active (Middle Mouse DOWN)");
       }
     }
   } else {
     if (starkPressStart != 0) {
-      unsigned long duration = now - starkPressStart;
-
       if (starkHeld) {
         // Release from Stark Grab Mode
         if (paired) {
@@ -308,24 +393,29 @@ void loop() {
           Serial.println("[STARK] Spatial Grab Released (Beaming Payload!)");
         }
       } else {
-        // Check for Double-Click (Recenter Forward)
-        if (now - lastStarkClick < 350) {
+        // Button was released before hold threshold -> Check for Double-Click vs Single-Click
+        if (pendingStarkClick && (now - lastStarkRelease < 350)) {
+          // Double-Click Confirmed!
           Serial.println("[STARK] Double-Click Detected: RECENTER FORWARD!");
           fX = 0;
           fY = 0;
-          lastStarkClick = 0;
+          pendingStarkClick = false;
         } else {
-          lastStarkClick = now;
-          // Short Click: Switch Bluetooth Profile
-          Serial.println("[BLE] Short Click: Switching Bluetooth Profile Slot...");
-          activeSlot = (activeSlot == 1) ? 2 : 1;
-          saveSetting("slot", (float)activeSlot);
-          applyProfileSlot(activeSlot);
+          // First click released: mark pending and wait briefly to see if second click arrives
+          pendingStarkClick = true;
+          lastStarkRelease = now;
         }
       }
       starkPressStart = 0;
       starkHeld = false;
     }
+  }
+
+  // If a single click was released and double-click window expired -> trigger profile switch!
+  if (pendingStarkClick && (now - lastStarkRelease >= 350)) {
+    pendingStarkClick = false;
+    int targetSlot = (activeSlot == 1) ? 2 : 1;
+    switchProfileSlot(targetSlot);
   }
 
   // ---------------------------------------------------------------------------

@@ -79,17 +79,31 @@ Ensure both laptops are on the same Wi-Fi network and run:
 python cosmic.py
 ```
 
-### 4. Point & Click Pairing
-1. When Laptop B starts the app, Laptop A prompts:
-   `AIM AT LAPTOP B & CLICK BUTTON 3 TO PAIR`.
-2. Point your Air Mouse directly at physical Laptop B and click **Button 3**.
-3. Laptop B's blip is now locked at that exact angle on your tactical radar.
+### 4. Interactive Pairing with Key & Bidirectional Radar Sync
+1. Both laptops run `cosmic.py` with the same **Pairing Key** (default: `COSMIC-8492`).
+2. When Laptop B is discovered, an interactive prompt appears on both laptops asking to accept pairing with the shared key.
+3. Click **Accept**: Mutual trust (`[TRUSTED: ✔]`) is established, and Laptop B appears on Laptop A's 360° Tactical Radar.
+4. **Physically Point & Sync from Laptop A**:
+   - Point your Air Mouse directly at physical Laptop B.
+   - Click **`📍 Point & Sync to Peer`** on Laptop A.
+   - **How Laptop B locates Laptop A**: Laptop A automatically transmits the spatial angle over Wi-Fi! Laptop B's radar automatically calculates the reciprocal angle (e.g. if Laptop B is to Laptop A's right at $45^\circ$, Laptop A is automatically plotted at $315^\circ$ on Laptop B's radar!). **Zero manual setup needed on Laptop B!**
 
-### 5. Beam Across Devices (The Tony Stark Workflow)
-1. **Right-click any file** in Windows Explorer (or have a file copied/screenshot).
-2. **Press & Hold Button 3** $\to$ `[⚡ READY TO SEND [filename]]`.
-3. **Turn your arm toward Laptop B** $\to$ `[🎯 TARGET LOCKED: LAPTOP B]`.
-4. **Release Button 3** $\to$ The file streams over Wi-Fi in under 0.3s and opens full-screen on Laptop B!
+### 5. Dual-Laptop Switching (Button 3 Single Click)
+- **Single-click Button 3** (GPIO 23) on the Air Mouse (<400ms):
+  - Toggles between **Slot 1 (`COSMIC AIRMOUSE-A`)** and **Slot 2 (`COSMIC AIRMOUSE-B`)**.
+  - Reboots cleanly to the target laptop's dedicated hardware MAC address so it never hijacks the other laptop.
+
+### 6. Beam Across Devices (Hold to Move & Spatial Beam)
+1. **Right-click / select any file** in Windows Explorer (or have a file copied/screenshot).
+2. **Press & Hold Button 3** $\to$ Floating HUD displays `[⚡ READY TO SEND [filename]]`.
+3. **Turn your arm toward Laptop B** $\to$ Radar locks on and HUD turns glowing green: `[🎯 TARGET LOCKED: LAPTOP B]`.
+4. **Release Button 3** $\to$ The file streams over Wi-Fi in under 0.3s and **instantly auto-pops up full-screen** on Laptop B!
+
+### 7. Hardware Live Tuning (Freeze & Calibrate)
+1. Plug ESP32 into USB and select the COM port in Cosmic Link.
+2. Click **`❄️ FREEZE AIR MOUSE FOR TUNING`**: The ESP32 halts cursor movement so your mouse freezes while you adjust sliders.
+3. Tune **Sensitivity** and **Smoothing** sliders in the app.
+4. Click **`🚀 CONFIRM, FLASH & CALIBRATE GYRO`**: Prompts confirmation, writes new values to ESP32 Flash memory, keeps mouse still for 2s while gyro calibrates, and automatically unfreezes the mouse!
 
 ---
 

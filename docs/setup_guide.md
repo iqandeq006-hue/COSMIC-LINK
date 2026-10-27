@@ -76,7 +76,11 @@ python cosmic.py
 
 - When the application starts, you will see your **Laptop's Wi-Fi IP** in the header:
   `Local IP: 192.168.1.xxx | Key: COSMIC-8492`
-- When both laptops run `cosmic.py`, they automatically discover each other in the background. A blip representing the other laptop appears on the **Tactical Spatial Radar**.
+- When both laptops run `cosmic.py`, they discover each other on the Wi-Fi network:
+  1. An interactive dialog prompts: `"Device detected. Do you want to accept pairing with Key: COSMIC-8492?"`.
+  2. Click **Yes** on both laptops to establish mutual trust (`[TRUSTED: ✔]`).
+  3. On **Laptop A** (with Air Mouse), aim physically at Laptop B and click **`📍 Point & Sync to Peer`**.
+  4. **Automatic Spatial Synchronization**: Laptop A streams its bearing to Laptop B over Wi-Fi. Laptop B automatically computes the reciprocal angle (e.g. if B is at $+45^\circ$, A is placed at $315^\circ$ on B's radar!). Neither laptop requires manual angle typing!
 
 ---
 
@@ -124,3 +128,20 @@ To beam a file from the active laptop to the other laptop:
    - `cosmic.py` streams the file directly over high-speed TCP.
    - The HUD confirms: `✔ SENT TO [LAPTOP_NAME]!`.
    - The receiving laptop instantly saves the file to its `Documents\CosmicDropZone` folder and opens it full screen automatically with zero prompts!
+
+---
+
+### 3.7 Air Mouse Live Tuning (Freeze & Calibrate)
+
+You can tune the mouse cursor sensitivity and motion smoothing on-the-fly and write it directly to ESP32 Flash memory:
+
+1. Plug the ESP32 into a USB port on your laptop.
+2. In `cosmic.py`, choose the detected **COM Port** in the Hardware Tuning section and click **Connect**.
+3. Click **`❄️ FREEZE AIR MOUSE FOR TUNING`**:
+   - The ESP32 immediately ignores gyro movements and button clicks so the cursor freezes in place.
+   - This prevents erratic mouse movement while you adjust sliders on your screen.
+4. Adjust the **Sensitivity** and **Smoothing** sliders to your desired values.
+5. Click **`🚀 CONFIRM, FLASH & CALIBRATE GYRO`**:
+   - A confirmation prompt will ask to proceed.
+   - Keep the Air Mouse completely flat and still on your desk for 2 seconds.
+   - Cosmic Link writes the new settings to the ESP32's flash (`<Preferences.h>`), recalculates gyro calibration offsets, and automatically unfreezes the mouse!
