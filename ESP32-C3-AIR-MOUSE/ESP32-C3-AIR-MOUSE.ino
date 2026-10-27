@@ -1,21 +1,20 @@
 /*
  * =============================================================================
- * COSMIC AIR MOUSE - STARK EDITION (Standard Dual-Core ESP32)
+ * COSMIC AIR MOUSE - STARK EDITION (ESP32-C3 / Standard ESP32)
  * For use with COSMIC LINK Desktop App
  * =============================================================================
  * Features:
- * - 6-Axis MPU6050 Motion tracking (Gyro + Accel).
+ * - 6-Axis MPU6050 Motion tracking with Anti-Drift Noise Gate.
+ *   (Cursor never moves on its own when resting or held still!)
  * - Button 1 (GPIO 18): Left Click / Scroll Down on hold.
  * - Button 2 (GPIO 19): Right Click / Scroll Up on hold.
  * - Button 3 (GPIO 23) - Multi-Function "Stark" Button:
  *     * Click (<400ms): Switch Bluetooth Profile (Slot 1 <-> Slot 2).
  *     * Double-Click (<350ms): Quick Recenter Forward (0°).
  *     * Hold (>400ms): Spatial Grab Mode (Triggers Cosmic Link Beam).
- * - Live Sensitivity Tuning:
- *     * Sensitivity & Smoothing stored in ESP32 Flash (<Preferences.h>).
- *     * Adjustable on-the-fly via Serial/BLE without recompiling!
+ * - Calibrated sensitivity and smoothing for effortless cursor control.
  *
- * Pinout (Standard ESP32 WROOM / DevKit):
+ * Pinout:
  * - MPU6050 SDA  -> GPIO 21
  * - MPU6050 SCL  -> GPIO 22
  * - Left Button  -> GPIO 18
@@ -48,10 +47,11 @@
 // -----------------------------------------------------------------------------
 Preferences prefs;
 
-float sensitivity = 0.20;
-float smoothing   = 0.82;
-int   deadzone    = 1;
-int   activeSlot  = 1;  // 1 = Laptop A, 2 = Laptop B
+// Tuned for butter-smooth control with zero phantom movement
+const float sensitivity   = 0.22f;  // Balanced, natural speed
+const float smoothing     = 0.84f;  // Silky smooth motion
+const float deadbandGyro  = 1.80f;  // Anti-drift noise gate: stops resting drift dead in its tracks!
+int   activeSlot          = 1;      // 1 = Laptop A, 2 = Laptop B
 
 // -----------------------------------------------------------------------------
 // BLE MOUSE INSTANCE (Dynamic Pointer for Profile Switching)
@@ -76,7 +76,6 @@ bool pendingStarkClick          = false;
 bool leftHeld  = false;
 bool rightHeld = false;
 bool starkHeld = false;
-bool isFrozen  = false;  // Frozen during desktop app tuning
 
 const unsigned long clickThreshold = 180;
 const unsigned long holdThreshold  = 400;
@@ -90,9 +89,6 @@ const unsigned long scrollDelay = 120;
 // =============================================================================
 void loadPreferences() {
   prefs.begin("airmouse", false);
-  sensitivity = prefs.getFloat("sens", 0.20);
-  smoothing   = prefs.getFloat("smooth", 0.82);
-  deadzone    = prefs.getInt("dead", 1);
   activeSlot  = prefs.getInt("slot", 1);
   prefs.end();
 
@@ -101,14 +97,7 @@ void loadPreferences() {
   }
 
   Serial.println("\n[CONFIG] Loaded settings from Flash:");
-  Serial.printf("  Sensitivity: %.2f | Smoothing: %.2f | Deadzone: %d | Profile Slot: %d\n\n",
-                sensitivity, smoothing, deadzone, activeSlot);
-}
-
-void saveSetting(const char* key, float val) {
-  prefs.begin("airmouse", false);
-  prefs.putFloat(key, val);
-  prefs.end();
+  Serial.printf("  Active Profile Slot: %d\n\n", activeSlot);
 }
 
 void saveSettingInt(const char* key, int val) {
@@ -119,16 +108,16 @@ void saveSettingInt(const char* key, int val) {
 
 
 // =============================================================================
-// CALIBRATION
+// CALIBRATION (Keep still while calibrating to prevent bias offset!)
 // =============================================================================
 void calibrateGyro() {
   Serial.println("========================================");
-  Serial.println("  Calibrating Gyro (Keep Still!)");
+  Serial.println("  Calibrating Gyro (Keep Flat & Still!) ");
   Serial.println("========================================");
 
   float sumZ = 0;
   float sumY = 0;
-  const int samples = 400;
+  const int samples = 500;
 
   for (int i = 0; i < samples; i++) {
     mpu6050.update();
@@ -139,7 +128,7 @@ void calibrateGyro() {
 
   gyroBiasZ = sumZ / samples;
   gyroBiasY = sumY / samples;
-  Serial.printf("Gyro Biases: Z=%.2f, Y=%.2f\n\n", gyroBiasZ, gyroBiasY);
+  Serial.printf("Calibrated Gyro Biases: Z=%.2f, Y=%.2f\n\n", gyroBiasZ, gyroBiasY);
 }
 
 
@@ -150,7 +139,7 @@ void calibrateGyro() {
 // =============================================================================
 void applyProfileSlot(int slot) {
   if (mouse != nullptr) {
-    mouse->end();
+    mouse->beforeSleep();
     delay(100);
     delete mouse;
     mouse = nullptr;
@@ -183,7 +172,7 @@ void switchProfileSlot(int newSlot) {
   saveSettingInt("slot", newSlot);
 
   if (mouse != nullptr) {
-    mouse->end();
+    mouse->beforeSleep();
     delay(100);
   }
 
@@ -209,11 +198,6 @@ void setup() {
   loadPreferences();
 
   // 2. Configure unique hardware MAC address for the active profile slot.
-  // CRITICAL: Must be called BEFORE BLEDevice::init() / mouse->begin().
-  // Slot 1 uses factory base MAC (Laptop A).
-  // Slot 2 uses modified base MAC (Laptop B).
-  // Because the MAC addresses are different, Laptop A will NOT auto-connect
-  // or hijack the connection when Slot 2 is active!
   uint8_t baseMac[6];
   if (esp_efuse_mac_get_default(baseMac) == ESP_OK) {
     if (activeSlot == 2) {
@@ -244,71 +228,9 @@ void setup() {
 
 
 // =============================================================================
-// SERIAL LIVE TUNING PARSER
-// Allows Comet Link app to change sensitivity without flashing!
-// Format: SENS:0.35 or SMOOTH:0.85
-// =============================================================================
-void checkSerialCommands() {
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-
-    if (line.startsWith("SENS:")) {
-      sensitivity = line.substring(5).toFloat();
-      saveSetting("sens", sensitivity);
-      Serial.printf("[UPDATE] Sensitivity set to %.2f and saved to Flash!\n", sensitivity);
-    }
-    else if (line.startsWith("SMOOTH:")) {
-      smoothing = line.substring(7).toFloat();
-      saveSetting("smooth", smoothing);
-      Serial.printf("[UPDATE] Smoothing set to %.2f and saved to Flash!\n", smoothing);
-    }
-    else if (line.startsWith("RECENTER")) {
-      fX = 0;
-      fY = 0;
-      Serial.println("[RECENTER] Recenter forward acknowledged.");
-    }
-    else if (line.startsWith("FREEZE")) {
-      isFrozen = true;
-      Serial.println("[FREEZE] Air Mouse movement frozen for desktop tuning.");
-    }
-    else if (line.startsWith("UNFREEZE")) {
-      isFrozen = false;
-      Serial.println("[UNFREEZE] Air Mouse unfrozen.");
-    }
-    else if (line.startsWith("CALIBRATE")) {
-      Serial.println("[CALIBRATE] Calibrating Gyro (Keep Still!)...");
-      calibrateGyro();
-      fX = 0;
-      fY = 0;
-      isFrozen = false;
-      Serial.println("[CALIBRATE_OK] Gyro calibrated and mouse unfrozen!");
-    }
-    else if (line.startsWith("SLOT:")) {
-      int s = line.substring(5).toInt();
-      if (s == 1 || s == 2) {
-        switchProfileSlot(s);
-      }
-    }
-    else if (line.equalsIgnoreCase("TOGGLE")) {
-      switchProfileSlot((activeSlot == 1) ? 2 : 1);
-    }
-  }
-}
-
-
-// =============================================================================
 // MAIN LOOP
 // =============================================================================
 void loop() {
-  checkSerialCommands();
-
-  // If frozen for live desktop tuning, halt all motion and button output
-  if (isFrozen) {
-    delay(20);
-    return;
-  }
-
   mpu6050.update();
 
   unsigned long now = millis();
@@ -395,7 +317,7 @@ void loop() {
       } else {
         // Button was released before hold threshold -> Check for Double-Click vs Single-Click
         if (pendingStarkClick && (now - lastStarkRelease < 350)) {
-          // Double-Click Confirmed!
+          // Double-Click Confirmed: Re-zero filter and recenter forward
           Serial.println("[STARK] Double-Click Detected: RECENTER FORWARD!");
           fX = 0;
           fY = 0;
@@ -419,27 +341,33 @@ void loop() {
   }
 
   // ---------------------------------------------------------------------------
-  // MOTION TRACKING & CURSOR MOVEMENT
+  // MOTION TRACKING & CURSOR MOVEMENT (With Anti-Drift Noise Gate)
   // ---------------------------------------------------------------------------
   if (!paired) {
     delay(5);
     return;
   }
 
-  float gyroX = -(mpu6050.getGyroZ() - gyroBiasZ);
-  float gyroY =   mpu6050.getGyroY() - gyroBiasY;
+  float rawZ = mpu6050.getGyroZ() - gyroBiasZ;
+  float rawY = mpu6050.getGyroY() - gyroBiasY;
 
-  // Smoothing
-  fX = fX * smoothing + gyroX * (1.0 - smoothing);
-  fY = fY * smoothing + gyroY * (1.0 - smoothing);
+  // Anti-Drift Noise Gate: When resting on table or still, clamp to ZERO!
+  if (fabs(rawZ) < deadbandGyro) rawZ = 0;
+  if (fabs(rawY) < deadbandGyro) rawY = 0;
 
-  // Sensitivity
+  float gyroX = -rawZ;
+  float gyroY =  rawY;
+
+  // Smoothing filter with stationary decay
+  if (rawZ == 0) fX *= 0.70f;
+  else fX = fX * smoothing + gyroX * (1.0f - smoothing);
+
+  if (rawY == 0) fY *= 0.70f;
+  else fY = fY * smoothing + gyroY * (1.0f - smoothing);
+
+  // Apply sensitivity
   float moveX = fX * sensitivity;
   float moveY = fY * sensitivity;
-
-  // Deadzone filter
-  if (fabs(moveX) < deadzone) moveX = 0;
-  if (fabs(moveY) < deadzone) moveY = 0;
 
   int mouseX = (int)moveX;
   int mouseY = (int)moveY;
