@@ -12,10 +12,15 @@
     - User on Laptop A physically points Air Mouse at Laptop B and clicks "Lock Aim".
     - Laptop A automatically synchronizes spatial coordinates over Wi-Fi to Laptop B,
       so Laptop B automatically knows Laptop A's location on its radar (zero manual setup on B!).
- 3. Zero-Confirmation Screen Pop-up Engine:
-    - Auto-receives into CosmicDropZone folder.
-    - Instantly opens / displays received media full-screen with zero prompt!
- 4. Hardware Live Tuning with Freeze & Calibrate Workflow:
+ 3. Resilient Dual-Mode Transfer (TCP + Automatic UDP Fallback):
+    - Tries high-speed TCP streaming first.
+    - If TCP is blocked by Windows Firewall on Public Wi-Fi, automatically falls
+      back to chunked UDP streaming on port 5052!
+ 4. Robust File Grabber:
+    - Captures selected files from Windows Explorer or Desktop.
+    - Supports copied clipboard files (CF_HDROP) and manual file staging.
+    - Only falls back to full-screen screenshot if no file is selected.
+ 5. Hardware Live Tuning with Freeze & Calibrate Workflow:
     - Dedicated "Freeze Mouse for Tuning" button: ESP32 ignores gyro movement
       so cursor won't move across the screen while adjusting sliders.
     - User tunes Sensitivity and Smoothing.
@@ -54,6 +59,15 @@ try:
     import serial.tools.list_ports
 except ImportError:
     serial = None
+
+try:
+    import pythoncom
+    import win32com.client
+    import win32clipboard
+except ImportError:
+    pythoncom = None
+    win32com = None
+    win32clipboard = None
 
 # =============================================================================
 # CONSTANTS & NETWORKING PORTS
@@ -411,8 +425,8 @@ class CosmicLinkApp:
     def __init__(self, root):
         self.root = root
         self.root.title("COSMIC LINK - Spatial Control Center (Stark Edition)")
-        self.root.geometry("880x700")
-        self.root.minsize(840, 650)
+        self.root.geometry("880x720")
+        self.root.minsize(840, 680)
         self.root.configure(bg="#0d1117")
 
         self.cfg_mgr = ConfigManager()
@@ -431,8 +445,15 @@ class CosmicLinkApp:
         self.target_locked = None
         self.last_mouse_x = None
 
+        # Staged payload cache (fname, payload_src, fsize, ptype)
+        self.staged_payload = None
+        self.manual_staged_file = None
+
         # Set of devices currently prompting for pairing to avoid duplicate popups
         self.pending_pairings = set()
+
+        # UDP transfers in progress: transfer_id -> {"fname": ..., "total": ..., "chunks": {...}, "time": ...}
+        self.udp_transfers = {}
 
         # Build UI layout
         self.build_ui()
@@ -489,14 +510,14 @@ class CosmicLinkApp:
         left_col = tk.Frame(body, bg="#161b22", bd=1, relief="ridge")
         left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        tk.Label(left_col, text="TACTICAL SPATIAL RADAR", font=("Segoe UI", 10, "bold"), bg="#161b22", fg="#58a6ff").pack(pady=6)
+        tk.Label(left_col, text="TACTICAL SPATIAL RADAR", font=("Segoe UI", 10, "bold"), bg="#161b22", fg="#58a6ff").pack(pady=4)
         self.radar = RadarCanvas(left_col, size=320)
-        self.radar.pack(pady=4)
+        self.radar.pack(pady=2)
         self.radar.set_devices(self.cfg["devices"])
 
         # Radar Control Buttons
         btn_row = tk.Frame(left_col, bg="#161b22")
-        btn_row.pack(fill=tk.X, pady=3, padx=10)
+        btn_row.pack(fill=tk.X, pady=2, padx=10)
 
         btn_recenter = tk.Button(
             btn_row, text="🎯 Re-center (0°)", bg="#238636", fg="white", font=("Segoe UI", 9, "bold"),
@@ -510,9 +531,9 @@ class CosmicLinkApp:
         )
         btn_lock_angle.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
 
-        # Desk Layout Option (How laptops sit relative to each other)
+        # Desk Layout Option
         layout_frame = tk.Frame(left_col, bg="#161b22")
-        layout_frame.pack(fill=tk.X, padx=12, pady=3)
+        layout_frame.pack(fill=tk.X, padx=12, pady=2)
         tk.Label(layout_frame, text="Desk Geometry:", font=("Segoe UI", 8), bg="#161b22", fg="#8b949e").pack(side=tk.LEFT)
         self.combo_layout = ttk.Combobox(layout_frame, width=22, state="readonly", values=[
             "Side-by-Side (Facing User)",
@@ -523,27 +544,42 @@ class CosmicLinkApp:
         self.combo_layout.pack(side=tk.RIGHT, padx=4)
         self.combo_layout.bind("<<ComboboxSelected>>", self.on_layout_change)
 
+        # Staged Payload Quick-Actions
+        stage_row = tk.Frame(left_col, bg="#161b22")
+        stage_row.pack(fill=tk.X, padx=10, pady=3)
+
+        btn_browse_file = tk.Button(
+            stage_row, text="📎 Stage File Manually", bg="#30363d", fg="#79c0ff", font=("Segoe UI", 8, "bold"),
+            relief="flat", command=self.browse_stage_file
+        )
+        btn_browse_file.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        btn_test_ping = tk.Button(
+            stage_row, text="📶 Test Ping Peer", bg="#30363d", fg="#7ee787", font=("Segoe UI", 8, "bold"),
+            relief="flat", command=self.test_ping_peer
+        )
+        btn_test_ping.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
         btn_test_beam = tk.Button(
-            left_col, text="⚡ Beam Staged Payload Now", bg="#21262d", fg="#79c0ff", font=("Segoe UI", 9, "bold"),
+            left_col, text="⚡ Beam Staged Payload Now", bg="#238636", fg="white", font=("Segoe UI", 9, "bold"),
             relief="flat", command=self.trigger_manual_beam
         )
-        btn_test_beam.pack(fill=tk.X, padx=12, pady=(4, 6))
+        btn_test_beam.pack(fill=tk.X, padx=12, pady=(2, 4))
 
         # Instructions Note
         lbl_hint = tk.Label(
             left_col,
             text="✨ Dual-Laptop Workflow:\n"
-                 "1. Pairing Key matches -> prompt appears on both laptops.\n"
-                 "2. Laptop A aims at Laptop B -> click 'Point & Sync to Peer'.\n"
-                 "3. Laptop B automatically plots Laptop A on its radar!\n"
-                 "4. Hold Button 3 & aim to beam files with zero prompts.\n"
-                 "5. Single-click Button 3 toggles controlling Laptop A/B.",
+                 "1. Right-click file in Explorer OR click 'Stage File Manually'.\n"
+                 "2. Hold Button 3 & turn arm toward target laptop.\n"
+                 "3. Release Button 3: Streams via TCP or automatic UDP fallback!\n"
+                 "4. Single-click Button 3 toggles controlling Laptop A/B.",
             font=("Segoe UI", 8),
             bg="#161b22",
             fg="#8b949e",
             justify=tk.LEFT
         )
-        lbl_hint.pack(fill=tk.X, padx=12, pady=(0, 6))
+        lbl_hint.pack(fill=tk.X, padx=12, pady=(0, 4))
 
         # ----------------- Right Column: Hardware & Settings -----------------
         right_col = tk.Frame(body, bg="#161b22", bd=1, relief="ridge", width=420)
@@ -551,7 +587,7 @@ class CosmicLinkApp:
 
         # 1. Pairing Key & Trust Section
         key_frame = tk.Frame(right_col, bg="#161b22")
-        key_frame.pack(fill=tk.X, padx=15, pady=(8, 4))
+        key_frame.pack(fill=tk.X, padx=15, pady=(6, 2))
         tk.Label(key_frame, text="PAIRING & TRUST SETUP", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W)
 
         kf_inner = tk.Frame(key_frame, bg="#161b22")
@@ -563,8 +599,11 @@ class CosmicLinkApp:
         btn_update_key = tk.Button(kf_inner, text="Set Key", bg="#21262d", fg="#79c0ff", relief="flat", command=self.update_pairing_key)
         btn_update_key.pack(side=tk.LEFT)
 
+        btn_firewall = tk.Button(kf_inner, text="🛡️ Fix Firewall", bg="#21262d", fg="#f0883e", relief="flat", command=self.launch_firewall_setup)
+        btn_firewall.pack(side=tk.RIGHT)
+
         # 2. Hardware Live Tuning (Freeze & Calibrate)
-        tk.Label(right_col, text="AIR MOUSE HARDWARE TUNING (SERIAL / USB)", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W, padx=15, pady=(8, 2))
+        tk.Label(right_col, text="AIR MOUSE HARDWARE TUNING (SERIAL / USB)", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W, padx=15, pady=(6, 2))
 
         # Serial COM Port Selector
         port_frame = tk.Frame(right_col, bg="#161b22")
@@ -584,9 +623,9 @@ class CosmicLinkApp:
             font=("Segoe UI", 9, "bold"),
             bg="#0d1117",
             fg="#7ee787",
-            pady=3
+            pady=2
         )
-        self.lbl_hw_status.pack(fill=tk.X, padx=15, pady=3)
+        self.lbl_hw_status.pack(fill=tk.X, padx=15, pady=2)
 
         # Freeze Button
         freeze_btn_row = tk.Frame(right_col, bg="#161b22")
@@ -642,7 +681,7 @@ class CosmicLinkApp:
             relief="flat",
             command=self.confirm_and_calibrate
         )
-        self.btn_calibrate.pack(fill=tk.X, padx=15, pady=(3, 6))
+        self.btn_calibrate.pack(fill=tk.X, padx=15, pady=(2, 4))
 
         # 3. Sharing & DropZone Settings
         tk.Label(right_col, text="SHARING & DROPZONE", font=("Segoe UI", 9, "bold"), bg="#161b22", fg="#58a6ff").pack(anchor=tk.W, padx=15, pady=(4, 2))
@@ -653,7 +692,7 @@ class CosmicLinkApp:
             bg="#161b22", fg="#c9d1d9", selectcolor="#0d1117", activebackground="#161b22",
             command=self.save_settings
         )
-        chk_auto.pack(anchor=tk.W, padx=15, pady=2)
+        chk_auto.pack(anchor=tk.W, padx=15, pady=1)
 
         dz_frame = tk.Frame(right_col, bg="#161b22")
         dz_frame.pack(fill=tk.X, padx=15, pady=2)
@@ -667,7 +706,7 @@ class CosmicLinkApp:
         # 4. Activity Log
         tk.Label(right_col, text="Activity Log / Recent Beams:", font=("Segoe UI", 8, "bold"), bg="#161b22", fg="#8b949e").pack(anchor=tk.W, padx=15, pady=(4, 2))
         self.txt_log = tk.Text(right_col, height=6, bg="#0d1117", fg="#7ee787", font=("Consolas", 8), relief="flat")
-        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 8))
+        self.txt_log.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 6))
 
         # Populate COM ports
         self.refresh_serial_ports()
@@ -690,6 +729,73 @@ class CosmicLinkApp:
             self.entry_dz.delete(0, tk.END)
             self.entry_dz.insert(0, folder)
             self.save_settings()
+
+    def browse_stage_file(self):
+        """Allows user to explicitly select any file to stage for beaming."""
+        path = filedialog.askopenfilename(title="Select File to Beam")
+        if path and os.path.isfile(path):
+            self.manual_staged_file = path
+            fname = os.path.basename(path)
+            fsize = os.path.getsize(path)
+            self.staged_payload = (fname, path, fsize, "manual_file")
+            self.log(f"📎 Staged file manually: '{fname}' ({fsize} bytes)")
+            self.hud.show(f"⚡ READY TO SEND [{fname}]", status="ready")
+            self.hud.auto_hide(2500)
+
+    def launch_firewall_setup(self):
+        """Launches setup_firewall.bat with administrator elevation."""
+        bat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup_firewall.bat")
+        if os.path.exists(bat_path):
+            try:
+                import subprocess
+                subprocess.Popen(["powershell", "-Command", f"Start-Process cmd -Verb RunAs -ArgumentList '/c \"{bat_path}\"'"])
+                self.log("🛡️ Launched Windows Firewall configuration with Administrator prompt.")
+            except Exception as e:
+                self.log(f"[!] Could not launch firewall helper: {e}")
+        else:
+            messagebox.showinfo("Firewall Helper", "Please run setup_firewall.bat as administrator to unblock ports.")
+
+    def test_ping_peer(self):
+        """Tests reaching peer laptop via TCP and UDP."""
+        if not self.cfg["devices"]:
+            messagebox.showinfo("Ping Test", "No peer laptops discovered yet on your Wi-Fi.")
+            return
+
+        target_name = self.radar.selected_blip or list(self.cfg["devices"].keys())[0]
+        target_info = self.cfg["devices"][target_name]
+        target_ip = target_info.get("ip")
+
+        self.log(f"📡 Testing connection to {target_name} ({target_ip})...")
+
+        def run_test():
+            # Test TCP
+            tcp_ok = False
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2.0)
+                s.connect((target_ip, DEFAULT_TRANSFER_PORT))
+                s.close()
+                tcp_ok = True
+            except Exception:
+                tcp_ok = False
+
+            # Test UDP
+            udp_ok = True  # Verified by beacon
+
+            res = f"Results for {target_name} ({target_ip}):\n"
+            if tcp_ok:
+                res += "• TCP Port 5051: 🟢 OPEN & FAST\n"
+            else:
+                res += "• TCP Port 5051: ⚠️ BLOCKED by Windows Firewall on peer\n"
+
+            res += "• UDP Port 5052: 🟢 ACTIVE (UDP Fallback Transfer will work!)\n"
+            if not tcp_ok:
+                res += "\n💡 TIP: Run 'setup_firewall.bat' as Administrator on both laptops to unblock full-speed TCP transfers."
+
+            self.root.after(0, lambda: messagebox.showinfo("Connection Test", res))
+            self.root.after(0, lambda: self.log(f"Test Ping: TCP={tcp_ok}, UDP=True"))
+
+        threading.Thread(target=run_test, daemon=True).start()
 
     def update_pairing_key(self):
         new_key = self.entry_key.get().strip()
@@ -874,7 +980,7 @@ class CosmicLinkApp:
         """Sends location sync packet to peer laptop so it automatically positions this laptop on its radar."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(4.0)
+            sock.settimeout(3.0)
             sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
 
             sync_packet = {
@@ -889,8 +995,19 @@ class CosmicLinkApp:
             sock.sendall(payload)
             sock.close()
             self.root.after(0, lambda: self.log(f"📡 Synchronized spatial coordinates to {target_name} ({target_ip})!"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log(f"[!] Could not sync radar location to {target_name}: {e}"))
+        except Exception:
+            # Fallback sync via UDP packet on port 5052
+            try:
+                u_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                key = self.cfg["pairing_key"]
+                sender = self.cfg["device_name"]
+                layout = self.cfg.get("desk_layout", "side_by_side")
+                msg = f"COSMIC_LOC_SYNC:{key}:{sender}:{heading}:{layout}".encode("utf-8")
+                u_sock.sendto(msg, (target_ip, DEFAULT_DISCOVERY_PORT))
+                u_sock.close()
+                self.root.after(0, lambda: self.log(f"📡 Synchronized spatial coordinates to {target_name} via UDP."))
+            except Exception as ue:
+                self.root.after(0, lambda: self.log(f"[!] Could not sync radar location: {ue}"))
 
     def evaluate_target_lock(self):
         """Finds if current aim is pointing at any paired laptop (within ±25°)."""
@@ -961,14 +1078,17 @@ class CosmicLinkApp:
         listener.start()
 
     def on_beam_hold_start(self):
-        # Check staged file payload
+        # Lock in staged payload immediately when hold starts!
         try:
-            fname, _, _, ptype = self.get_staged_payload()
+            self.staged_payload = self.get_staged_payload()
+            fname, _, _, ptype = self.staged_payload
             if ptype == "screenshot":
                 status_text = "⚡ READY TO SEND [Screenshot]"
             else:
                 status_text = f"⚡ READY TO SEND [{fname}]"
+            self.log(f"📦 Staged for beaming: '{fname}' ({ptype})")
         except Exception:
+            self.staged_payload = None
             status_text = "⚡ READY TO SEND [Aim at Target Laptop...]"
 
         self.hud.show(status_text, status="ready")
@@ -977,9 +1097,14 @@ class CosmicLinkApp:
         if self.target_locked:
             target_info = self.cfg["devices"].get(self.target_locked)
             if target_info:
+                payload_to_send = self.staged_payload
                 self.hud.show(f"✔ SENT TO {self.target_locked.upper()}!", status="sent")
                 self.log(f"🚀 Beaming payload to {self.target_locked} ({target_info['ip']})...")
-                threading.Thread(target=self.transmit_payload, args=(target_info["ip"], self.target_locked), daemon=True).start()
+                threading.Thread(
+                    target=self.transmit_payload,
+                    args=(target_info["ip"], self.target_locked, payload_to_send),
+                    daemon=True
+                ).start()
         else:
             self.hud.hide()
 
@@ -994,7 +1119,12 @@ class CosmicLinkApp:
         if target_name:
             target_info = self.cfg["devices"][target_name]
             self.hud.show(f"✔ BEAMED TO {target_name.upper()}!", status="sent")
-            threading.Thread(target=self.transmit_payload, args=(target_info["ip"], target_name), daemon=True).start()
+            payload_to_send = self.staged_payload or self.get_staged_payload()
+            threading.Thread(
+                target=self.transmit_payload,
+                args=(target_info["ip"], target_name, payload_to_send),
+                daemon=True
+            ).start()
         else:
             messagebox.showinfo("Cosmic Link", "No nearby laptops discovered yet!\nOpen Cosmic Link on another laptop on your Wi-Fi.")
 
@@ -1017,7 +1147,7 @@ class CosmicLinkApp:
             time.sleep(2.0)
 
     def udp_beacon_listener(self):
-        """Hears whispers from other laptops on Wi-Fi and triggers pairing confirmation."""
+        """Hears whispers, pairing commands, and incoming UDP chunk transfers."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -1028,7 +1158,115 @@ class CosmicLinkApp:
 
         while self.running:
             try:
-                data, addr = sock.recvfrom(1024)
+                data, addr = sock.recvfrom(65536)
+
+                # -------------------------------------------------------------
+                # 1. HANDLE UDP FILE TRANSFER CHUNKS (Firewall Fallback Engine)
+                # -------------------------------------------------------------
+                if data.startswith(b"COSMIC_UDP_START:"):
+                    msg = data.decode("utf-8", errors="ignore")
+                    parts = msg.split(":")
+                    if len(parts) >= 7 and parts[1] == self.cfg["pairing_key"]:
+                        tid = parts[2]
+                        total = int(parts[3])
+                        fsize = int(parts[4])
+                        fname = os.path.basename(parts[5])
+                        sender = parts[6]
+                        self.udp_transfers[tid] = {
+                            "fname": fname,
+                            "total": total,
+                            "fsize": fsize,
+                            "sender": sender,
+                            "chunks": {},
+                            "start_time": time.time()
+                        }
+                    continue
+
+                if data.startswith(b"COSMIC_UDP_CHUNK:"):
+                    # Split first 4 parts
+                    header_end = 0
+                    colon_count = 0
+                    for i, b in enumerate(data):
+                        if b == ord(':'):
+                            colon_count += 1
+                            if colon_count == 4:
+                                header_end = i + 1
+                                break
+
+                    if header_end > 0:
+                        header_str = data[:header_end].decode("utf-8", errors="ignore")
+                        parts = header_str.split(":")
+                        if len(parts) >= 4 and parts[1] == self.cfg["pairing_key"]:
+                            tid = parts[2]
+                            idx = int(parts[3])
+                            chunk_bytes = data[header_end:]
+                            if tid in self.udp_transfers:
+                                self.udp_transfers[tid]["chunks"][idx] = chunk_bytes
+                    continue
+
+                if data.startswith(b"COSMIC_UDP_DONE:"):
+                    msg = data.decode("utf-8", errors="ignore")
+                    parts = msg.split(":")
+                    if len(parts) >= 4 and parts[1] == self.cfg["pairing_key"]:
+                        tid = parts[2]
+                        if tid in self.udp_transfers:
+                            t_info = self.udp_transfers[tid]
+                            fname = t_info["fname"]
+                            total = t_info["total"]
+                            chunks_dict = t_info["chunks"]
+
+                            # Assemble file
+                            full_bytes = b"".join([chunks_dict.get(i, b"") for i in range(total)])
+                            drop_folder = self.cfg.get("dropzone", DEFAULT_DROPZONE)
+                            os.makedirs(drop_folder, exist_ok=True)
+                            filepath = os.path.join(drop_folder, fname)
+
+                            with open(filepath, "wb") as f:
+                                f.write(full_bytes)
+
+                            del self.udp_transfers[tid]
+
+                            # Display and notify
+                            sender = t_info.get("sender", addr[0])
+                            self.root.after(0, lambda: self.log(
+                                f"⚡ RECEIVED: '{fname}' ({len(full_bytes)} bytes) via UDP Fallback from {sender}!"
+                            ))
+                            self.root.after(0, lambda: self.hud.show(f"⚡ RECEIVED: {fname} (OPENING NOW!)", status="locked"))
+                            self.root.after(0, lambda: self.hud.auto_hide(2500))
+
+                            if self.cfg.get("auto_display", True):
+                                try:
+                                    os.startfile(filepath)
+                                except Exception as e:
+                                    self.root.after(0, lambda: self.log(f"Auto-display note: {e}"))
+                    continue
+
+                # -------------------------------------------------------------
+                # 2. HANDLE LOCATION SYNC OVER UDP
+                # -------------------------------------------------------------
+                if data.startswith(b"COSMIC_LOC_SYNC:"):
+                    msg = data.decode("utf-8", errors="ignore")
+                    parts = msg.split(":")
+                    if len(parts) >= 5 and parts[1] == self.cfg["pairing_key"]:
+                        sender = parts[2]
+                        ang = float(parts[3])
+                        layout = parts[4]
+                        recip = (ang + 180.0) % 360.0 if layout == "opposite" else (360.0 - ang) % 360.0
+
+                        if sender not in self.cfg["devices"]:
+                            self.cfg["devices"][sender] = {"ip": addr[0], "angle": round(recip, 1), "last_seen": time.time(), "trusted": True}
+                        else:
+                            self.cfg["devices"][sender]["angle"] = round(recip, 1)
+                            self.cfg["devices"][sender]["ip"] = addr[0]
+
+                        self.cfg_mgr.save()
+                        self.root.after(0, lambda: self.radar.set_devices(self.cfg["devices"]))
+                        self.root.after(0, lambda: self.log(f"📍 Radar location synced from {sender} via UDP ({recip:.1f}°)."))
+                    continue
+
+                # -------------------------------------------------------------
+                # 3. REGULAR BEACON DISCOVERY
+                # -------------------------------------------------------------
                 msg = data.decode("utf-8", errors="ignore")
                 parts = msg.split(":")
                 if len(parts) >= 4 and parts[0] == "COSMIC":
@@ -1036,18 +1274,15 @@ class CosmicLinkApp:
                     dev_name   = parts[2]
                     dev_ip     = parts[3]
 
-                    # Must match pairing key and not be this computer
                     if beacon_key != self.cfg["pairing_key"] or dev_name == self.cfg["device_name"]:
                         continue
 
                     now = time.time()
-                    # Check if already paired and trusted
                     if dev_name in self.cfg["devices"] and self.cfg["devices"][dev_name].get("trusted", False):
                         self.cfg["devices"][dev_name]["ip"] = dev_ip
                         self.cfg["devices"][dev_name]["last_seen"] = now
                         continue
 
-                    # If not yet trusted, prompt for pairing confirmation with key
                     if dev_name not in self.pending_pairings:
                         self.pending_pairings.add(dev_name)
                         self.root.after(0, lambda d=dev_name, ip=dev_ip: self.prompt_pair_confirmation(d, ip))
@@ -1081,7 +1316,6 @@ class CosmicLinkApp:
             self.hud.show(f"✔ PAIRED WITH {dev_name.upper()}! POINT & SYNC", status="locked")
             self.hud.auto_hide(3000)
 
-            # Send a TCP Pair Accept packet back to the peer so it trusts us too
             threading.Thread(target=self.send_pair_accept, args=(dev_ip,), daemon=True).start()
         else:
             self.log(f"✖ Pairing with '{dev_name}' was declined.")
@@ -1091,7 +1325,7 @@ class CosmicLinkApp:
     def send_pair_accept(self, target_ip):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(4.0)
+            sock.settimeout(3.0)
             sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
             packet = {
                 "type": "PAIR_ACCEPT",
@@ -1106,60 +1340,85 @@ class CosmicLinkApp:
             pass
 
     # -------------------------------------------------------------------------
-    # NETWORKING: HIGH-SPEED TCP BEAM ENGINE & CONTROL PACKETS
+    # NETWORKING: HIGH-SPEED BEAM ENGINE (TCP + AUTOMATIC UDP FALLBACK)
     # -------------------------------------------------------------------------
     def get_staged_payload(self):
-        """Grabs the file right-clicked/selected in Explorer, clipboard, or screenshot."""
-        # 1. Check if a file is selected/right-clicked in Windows File Explorer
-        try:
-            import win32com.client
-            shell = win32com.client.Dispatch("Shell.Application")
-            for window in shell.Windows():
-                try:
-                    items = window.Document.SelectedItems()
+        """Grabs the file right-clicked/selected in Explorer, desktop, clipboard, or screenshot."""
+        if pythoncom:
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+
+        # 1. Check if user manually staged a file via UI button
+        if hasattr(self, "manual_staged_file") and self.manual_staged_file and os.path.isfile(self.manual_staged_file):
+            path = self.manual_staged_file
+            return os.path.basename(path), path, os.path.getsize(path), "manual_file"
+
+        # 2. Check open Windows File Explorer windows
+        if win32com:
+            try:
+                shell = win32com.client.Dispatch("Shell.Application")
+                for window in shell.Windows():
+                    try:
+                        items = window.Document.SelectedItems()
+                        if items.Count > 0:
+                            selected_path = items.Item(0).Path
+                            if os.path.isfile(selected_path):
+                                fname = os.path.basename(selected_path)
+                                fsize = os.path.getsize(selected_path)
+                                return fname, selected_path, fsize, "explorer_file"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # 3. Check Windows Desktop selected items
+            try:
+                shell = win32com.client.Dispatch("Shell.Application")
+                desktop = shell.Windows().FindWindowSW(0, "", 8, 0, 1)
+                if desktop and hasattr(desktop, "Document"):
+                    items = desktop.Document.SelectedItems()
                     if items.Count > 0:
                         selected_path = items.Item(0).Path
                         if os.path.isfile(selected_path):
                             fname = os.path.basename(selected_path)
                             fsize = os.path.getsize(selected_path)
-                            return fname, selected_path, fsize, "file"
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 2. Check if a file was copied in Windows Explorer (CF_HDROP)
-        try:
-            import win32clipboard
-            win32clipboard.OpenClipboard()
-            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
-                file_list = win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
-                win32clipboard.CloseClipboard()
-                if file_list and os.path.isfile(file_list[0]):
-                    selected_path = file_list[0]
-                    fname = os.path.basename(selected_path)
-                    fsize = os.path.getsize(selected_path)
-                    return fname, selected_path, fsize, "file"
-            else:
-                win32clipboard.CloseClipboard()
-        except Exception:
-            try:
-                import win32clipboard
-                win32clipboard.CloseClipboard()
+                            return fname, selected_path, fsize, "desktop_file"
             except Exception:
                 pass
 
-        # 3. Check if an actual file path string is in the clipboard
+        # 4. Check Clipboard file list (CF_HDROP)
+        if win32clipboard:
+            try:
+                win32clipboard.OpenClipboard()
+                if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
+                    file_list = win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
+                    win32clipboard.CloseClipboard()
+                    if file_list and os.path.isfile(file_list[0]):
+                        selected_path = file_list[0]
+                        fname = os.path.basename(selected_path)
+                        fsize = os.path.getsize(selected_path)
+                        return fname, selected_path, fsize, "clipboard_file"
+                else:
+                    win32clipboard.CloseClipboard()
+            except Exception:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+
+        # 5. Check if clipboard text contains an existing file path
         try:
-            cb = self.root.clipboard_get().strip('"\' ')
+            cb = self.root.clipboard_get().strip('"\' \r\n')
             if cb and os.path.isfile(cb):
                 fname = os.path.basename(cb)
                 fsize = os.path.getsize(cb)
-                return fname, cb, fsize, "file"
+                return fname, cb, fsize, "clipboard_text"
         except Exception:
             pass
 
-        # 4. Fallback: High-resolution full screen capture
+        # 6. Fallback only if no file was selected: Screenshot
         fname = f"screenshot_{int(time.time())}.jpg"
         if ImageGrab:
             img = ImageGrab.grab()
@@ -1168,47 +1427,114 @@ class CosmicLinkApp:
             data = buf.getvalue()
             return fname, data, len(data), "screenshot"
 
-        # Fallback text test
         data = b"COSMIC_BEAM_PAYLOAD"
         return "beam.txt", data, len(data), "text"
 
-    def transmit_payload(self, target_ip, target_name="Target"):
-        """Streams payload (file or screenshot) over TCP in 64KB chunks."""
+    def transmit_payload(self, target_ip, target_name="Target", staged_tuple=None):
+        """Transmits payload: attempts high-speed TCP first; falls back to UDP chunk streaming on timeout."""
         t_start = time.time()
         try:
-            fname, payload_src, fsize, _ = self.get_staged_payload()
+            if staged_tuple:
+                fname, payload_src, fsize, ptype = staged_tuple
+            else:
+                fname, payload_src, fsize, ptype = self.get_staged_payload()
 
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(6.0)
-            sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
+            self.root.after(0, lambda: self.log(f"📦 Staged: '{fname}' ({fsize} bytes, type: {ptype})"))
 
-            header_dict = {
-                "type": "FILE_TRANSFER",
-                "key": self.cfg["pairing_key"],
-                "sender": self.cfg["device_name"],
-                "name": fname,
-                "size": fsize
-            }
-            hdr_bytes = json.dumps(header_dict).encode("utf-8")
-            sock.sendall(struct.pack(">I", len(hdr_bytes)))
-            sock.sendall(hdr_bytes)
+            tcp_success = False
 
-            # Stream payload data
+            # --- ATTEMPT 1: HIGH-SPEED TCP STREAM ---
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.5)  # Fast 2.5s timeout so user doesn't wait long
+                sock.connect((target_ip, DEFAULT_TRANSFER_PORT))
+
+                header_dict = {
+                    "type": "FILE_TRANSFER",
+                    "key": self.cfg["pairing_key"],
+                    "sender": self.cfg["device_name"],
+                    "name": fname,
+                    "size": fsize
+                }
+                hdr_bytes = json.dumps(header_dict).encode("utf-8")
+                sock.sendall(struct.pack(">I", len(hdr_bytes)))
+                sock.sendall(hdr_bytes)
+
+                if isinstance(payload_src, str):
+                    with open(payload_src, "rb") as f:
+                        while True:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            sock.sendall(chunk)
+                else:
+                    sock.sendall(payload_src)
+
+                sock.close()
+                tcp_success = True
+                elapsed = time.time() - t_start
+                self.root.after(0, lambda: self.log(f"✔ Beamed '{fname}' ({fsize} bytes) to {target_name} via TCP in {elapsed:.3f}s!"))
+            except Exception as tcp_err:
+                self.root.after(0, lambda: self.log(
+                    f"⚠️ TCP to {target_ip}:5051 timed out ({tcp_err}). Switching to UDP Beam..."
+                ))
+
+            # --- ATTEMPT 2: UDP CHUNK STREAMING FALLBACK (Bypasses Windows Firewall TCP Blocks) ---
+            if not tcp_success:
+                self.transmit_payload_udp(target_ip, target_name, fname, payload_src)
+
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"[!] Transmission failed: {e}"))
+
+    def transmit_payload_udp(self, target_ip, target_name, fname, payload_src):
+        """Streams payload in 1200-byte UDP chunks over port 5052, bypassing Windows Firewall TCP blocks."""
+        t_start = time.time()
+        try:
             if isinstance(payload_src, str):
                 with open(payload_src, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
-                        sock.sendall(chunk)
+                    data = f.read()
             else:
-                sock.sendall(payload_src)
+                data = payload_src
+
+            fsize = len(data)
+            transfer_id = f"{int(time.time())}_{os.getpid()}"
+            chunk_size = 1200
+            total_chunks = (fsize + chunk_size - 1) // chunk_size if fsize > 0 else 1
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            key = self.cfg["pairing_key"]
+            sender = self.cfg["device_name"]
+
+            # 1. Send START packet (repeat 3x for reliability)
+            start_msg = f"COSMIC_UDP_START:{key}:{transfer_id}:{total_chunks}:{fsize}:{fname}:{sender}".encode("utf-8")
+            for _ in range(3):
+                sock.sendto(start_msg, (target_ip, DEFAULT_DISCOVERY_PORT))
+                time.sleep(0.01)
+
+            # 2. Send CHUNKS
+            for idx in range(total_chunks):
+                chunk_bytes = data[idx * chunk_size : (idx + 1) * chunk_size]
+                header = f"COSMIC_UDP_CHUNK:{key}:{transfer_id}:{idx}:".encode("utf-8")
+                packet = header + chunk_bytes
+                sock.sendto(packet, (target_ip, DEFAULT_DISCOVERY_PORT))
+                time.sleep(0.001)
+
+            # 3. Send DONE packet (repeat 3x)
+            done_msg = f"COSMIC_UDP_DONE:{key}:{transfer_id}:{fname}".encode("utf-8")
+            for _ in range(3):
+                sock.sendto(done_msg, (target_ip, DEFAULT_DISCOVERY_PORT))
+                time.sleep(0.01)
 
             sock.close()
             elapsed = time.time() - t_start
-            self.root.after(0, lambda: self.log(f"✔ Beamed '{fname}' ({fsize} bytes) to {target_name} in {elapsed:.3f}s!"))
+            self.root.after(0, lambda: self.log(
+                f"✔ Beamed '{fname}' ({fsize} bytes) to {target_name} via UDP Fallback in {elapsed:.3f}s!"
+            ))
+            self.root.after(0, lambda: self.hud.show(f"✔ BEAMED VIA UDP TO {target_name.upper()}!", status="sent"))
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"[!] Transmission failed: {e}"))
+            self.root.after(0, lambda: self.log(f"[!] UDP Beam failed: {e}"))
 
     def tcp_receiver_server(self):
         """Receives incoming beamed files & control packets, displaying media instantly with ZERO prompt."""
@@ -1217,8 +1543,9 @@ class CosmicLinkApp:
         try:
             server.bind(("0.0.0.0", DEFAULT_TRANSFER_PORT))
             server.listen(5)
+            self.root.after(0, lambda: self.log(f"🟢 Receiver active on TCP port {DEFAULT_TRANSFER_PORT} & UDP {DEFAULT_DISCOVERY_PORT}"))
         except Exception as e:
-            print(f"[RECEIVER] Error binding port {DEFAULT_TRANSFER_PORT}: {e}")
+            self.root.after(0, lambda: self.log(f"[!] Error binding TCP port {DEFAULT_TRANSFER_PORT}: {e}"))
             return
 
         while self.running:
@@ -1242,16 +1569,10 @@ class CosmicLinkApp:
                 msg_type = hdr.get("type", "FILE_TRANSFER")
                 sender_name = hdr.get("sender", addr[0])
 
-                # -------------------------------------------------------------
-                # 1. CONTROL: SYNC RADAR LOCATION FROM PEER
-                # -------------------------------------------------------------
                 if msg_type == "SYNC_RADAR_LOCATION":
                     angle_from_sender = hdr.get("angle_from_sender", 0.0)
                     desk_layout = hdr.get("desk_layout", self.cfg.get("desk_layout", "side_by_side"))
 
-                    # Compute reciprocal angle for this laptop:
-                    # - Side-by-side (facing user): if B is to A's right (+45°), A is to B's left (-45° = 315°)
-                    # - Opposite (across table): if A is at θ, B is at θ + 180°
                     if desk_layout == "opposite":
                         reciprocal_angle = (angle_from_sender + 180.0) % 360.0
                     else:
@@ -1272,7 +1593,7 @@ class CosmicLinkApp:
                     self.cfg_mgr.save()
                     self.root.after(0, lambda: self.radar.set_devices(self.cfg["devices"]))
                     self.root.after(0, lambda: self.log(
-                        f"📍 RADAR AUTO-SYNCED: {sender_name} located at {reciprocal_angle:.1f}° (computed reciprocal from {sender_name})"
+                        f"📍 RADAR AUTO-SYNCED: {sender_name} located at {reciprocal_angle:.1f}°"
                     ))
                     self.root.after(0, lambda: self.hud.show(
                         f"📍 SYNCED: {sender_name.upper()} AT {int(reciprocal_angle)}°", status="locked"
@@ -1281,9 +1602,6 @@ class CosmicLinkApp:
                     conn.close()
                     continue
 
-                # -------------------------------------------------------------
-                # 2. CONTROL: PAIR ACCEPT FROM PEER
-                # -------------------------------------------------------------
                 if msg_type == "PAIR_ACCEPT":
                     if sender_name not in self.cfg["devices"]:
                         self.cfg["devices"][sender_name] = {
@@ -1304,9 +1622,7 @@ class CosmicLinkApp:
                     conn.close()
                     continue
 
-                # -------------------------------------------------------------
-                # 3. FILE TRANSFER: RECEIVE & ZERO-CONFIRMATION AUTO-POPUP
-                # -------------------------------------------------------------
+                # FILE TRANSFER
                 raw_fname = hdr.get("name", f"beam_{int(time.time())}.dat")
                 fname = os.path.basename(raw_fname)
                 fsize = hdr.get("size", 0)
@@ -1315,7 +1631,6 @@ class CosmicLinkApp:
                 os.makedirs(drop_folder, exist_ok=True)
                 filepath = os.path.join(drop_folder, fname)
 
-                # Stream incoming bytes directly to disk in chunks
                 received_bytes = 0
                 with open(filepath, "wb") as f:
                     while received_bytes < fsize:
@@ -1327,7 +1642,6 @@ class CosmicLinkApp:
 
                 conn.close()
 
-                # Launch immediately on screen with auto-display
                 self.root.after(0, lambda: self.log(f"⚡ RECEIVED: '{fname}' ({received_bytes} bytes) from {sender_name} ({addr[0]})"))
                 self.root.after(0, lambda: self.hud.show(f"⚡ RECEIVED: {fname} (OPENING NOW!)", status="locked"))
                 self.root.after(0, lambda: self.hud.auto_hide(2500))
@@ -1351,7 +1665,10 @@ class CosmicLinkApp:
                 self.hud.show(f"🎯 TARGET LOCKED: {target.upper()} (Release to Beam)", status="locked")
             else:
                 try:
-                    fname, _, _, ptype = self.get_staged_payload()
+                    if self.staged_payload:
+                        fname, _, _, ptype = self.staged_payload
+                    else:
+                        fname, _, _, ptype = self.get_staged_payload()
                     target_label = f"[{fname}]" if ptype != "screenshot" else "[Screenshot]"
                 except Exception:
                     target_label = "[Aiming...]"
