@@ -134,7 +134,7 @@ void calibrateGyro() {
 // =============================================================================
 void applyProfileSlot(int slot) {
   if (mouse != nullptr) {
-    mouse->end();
+    mouse->beforeSleep();
     delay(250);
     delete mouse;
     mouse = nullptr;
@@ -144,6 +144,7 @@ void applyProfileSlot(int slot) {
   Serial.println("\n----------------------------------------");
   Serial.printf("[BLE] Profile Slot %d Active\n", slot);
   Serial.printf("[BLE] Advertising as \"%s\" (slot %d)\n", devName, slot);
+  
   Serial.println("----------------------------------------");
 
   mouse = new HijelBLEMouse(devName, "COSMIC", 100, 5, true);
