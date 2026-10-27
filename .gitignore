@@ -42,3 +42,10 @@ desktop.ini
 *.log
 tmp/
 temp/
+
+# Python cache & config
+__pycache__/
+*.pyc
+*.pyo
+.cosmic_link_config.json
+upstream-original/

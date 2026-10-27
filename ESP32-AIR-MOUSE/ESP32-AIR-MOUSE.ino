@@ -50,15 +50,9 @@ int   deadzone    = 1;
 int   activeSlot  = 1;  // 1 = Laptop A, 2 = Laptop B
 
 // -----------------------------------------------------------------------------
-// BLE MOUSE INSTANCE
+// BLE MOUSE INSTANCE (Dynamic Pointer for Profile Switching)
 // -----------------------------------------------------------------------------
-HijelBLEMouse mouse(
-  "COSMIC AIRMOUSE",
-  "COSMIC",
-  100,
-  5,
-  true
-);
+HijelBLEMouse* mouse = nullptr;
 
 MPU6050 mpu6050(Wire);
 
@@ -134,6 +128,33 @@ void calibrateGyro() {
 
 
 // =============================================================================
+// BLE PROFILE MANAGEMENT (Slot 1 <-> Slot 2)
+// Re-instantiates mouse dynamically to avoid 'setDeviceName' compiler errors
+// on all versions of HijelBLEMouse / BleMouse.
+// =============================================================================
+void applyProfileSlot(int slot) {
+  if (mouse != nullptr) {
+    mouse->end();
+    delay(250);
+    delete mouse;
+    mouse = nullptr;
+  }
+
+  const char* devName = (slot == 1) ? "COSMIC AIRMOUSE-A" : "COSMIC AIRMOUSE-B";
+  Serial.println("\n----------------------------------------");
+  Serial.printf("[BLE] Profile Slot %d Active\n", slot);
+  Serial.printf("[BLE] Advertising as \"%s\" (slot %d)\n", devName, slot);
+  Serial.println("----------------------------------------");
+
+  mouse = new HijelBLEMouse(devName, "COSMIC", 100, 5, true);
+  mouse->setUpdateRate(HIDRate::Hz125);
+  mouse->setBatteryLevel(100);
+  mouse->setLogLevel(HIDLogLevel::Normal);
+  mouse->begin();
+}
+
+
+// =============================================================================
 // SETUP
 // =============================================================================
 void setup() {
@@ -161,11 +182,8 @@ void setup() {
   mpu6050.calcGyroOffsets(true);
   calibrateGyro();
 
-  // BLE HID Setup
-  mouse.setUpdateRate(HIDRate::Hz125);
-  mouse.setBatteryLevel(100);
-  mouse.setLogLevel(HIDLogLevel::Normal);
-  mouse.begin();
+  // BLE HID Setup with active profile slot
+  applyProfileSlot(activeSlot);
 
   Serial.println("BLE Started. Waiting for connection...");
 }
@@ -208,7 +226,7 @@ void loop() {
   mpu6050.update();
 
   unsigned long now = millis();
-  bool paired = mouse.isPaired();
+  bool paired = (mouse != nullptr) && mouse->isPaired();
 
   // ---------------------------------------------------------------------------
   // BUTTON 1: LEFT CLICK / SCROLL UP
@@ -222,13 +240,13 @@ void loop() {
       leftHeld = true;
     }
     if (leftHeld && paired && (now - lastScrollTime >= scrollDelay)) {
-      mouse.addScroll(1);  // Scroll UP
+      mouse->addScroll(1);  // Scroll UP
       lastScrollTime = now;
     }
   } else {
     if (leftPressStart != 0) {
       if (!leftHeld && (now - leftPressStart < clickThreshold) && paired) {
-        mouse.click(MouseButton::Left, 20);
+        mouse->click(MouseButton::Left, 20);
       }
       leftPressStart = 0;
       leftHeld = false;
@@ -247,13 +265,13 @@ void loop() {
       rightHeld = true;
     }
     if (rightHeld && paired && (now - lastScrollTime >= scrollDelay)) {
-      mouse.addScroll(-1);  // Scroll DOWN
+      mouse->addScroll(-1);  // Scroll DOWN
       lastScrollTime = now;
     }
   } else {
     if (rightPressStart != 0) {
       if (!rightHeld && (now - rightPressStart < clickThreshold) && paired) {
-        mouse.click(MouseButton::Right, 20);
+        mouse->click(MouseButton::Right, 20);
       }
       rightPressStart = 0;
       rightHeld = false;
@@ -275,7 +293,7 @@ void loop() {
     if (!starkHeld && (now - starkPressStart >= holdThreshold)) {
       starkHeld = true;
       if (paired) {
-        mouse.press(MouseButton::Middle);  // Signals Comet Link overlay
+        mouse->press(MouseButton::Middle);  // Signals Comet Link overlay
         Serial.println("[STARK] Spatial Grab Active (Middle Mouse DOWN)");
       }
     }
@@ -286,7 +304,7 @@ void loop() {
       if (starkHeld) {
         // Release from Stark Grab Mode
         if (paired) {
-          mouse.release(MouseButton::Middle);
+          mouse->release(MouseButton::Middle);
           Serial.println("[STARK] Spatial Grab Released (Beaming Payload!)");
         }
       } else {
@@ -302,7 +320,7 @@ void loop() {
           Serial.println("[BLE] Short Click: Switching Bluetooth Profile Slot...");
           activeSlot = (activeSlot == 1) ? 2 : 1;
           saveSetting("slot", (float)activeSlot);
-          Serial.printf("Switched to Profile Slot %d\n", activeSlot);
+          applyProfileSlot(activeSlot);
         }
       }
       starkPressStart = 0;
@@ -337,7 +355,7 @@ void loop() {
   int mouseY = (int)moveY;
 
   if (mouseX != 0 || mouseY != 0) {
-    mouse.move(mouseX, mouseY);
+    mouse->move(mouseX, mouseY);
   }
 
   delay(5);

@@ -111,6 +111,38 @@ class ConfigManager:
         except Exception as e:
             print(f"[CONFIG] Error saving config: {e}")
 
+# -------------------------------------------------------------------------------
+# RESET TO DEFAULTS FUNCTIONALITY
+# -------------------------------------------------------------------------------
+def reset_to_defaults():
+    """Delete user config and restore defaults.
+    Also clears the DropZone folder.
+    """
+    # Remove config file if it exists
+    if os.path.exists(CONFIG_FILE):
+        try:
+            os.remove(CONFIG_FILE)
+            print(f"[RESET] Removed config file: {CONFIG_FILE}")
+        except Exception as e:
+            print(f"[RESET] Failed to delete config: {e}")
+
+    # Re‑create default config by instantiating ConfigManager (writes defaults)
+    cfg_mgr = ConfigManager()
+    cfg_mgr.save()
+    print("[RESET] Default configuration saved.")
+
+    # Clean DropZone folder (remove all files)
+    if os.path.isdir(DEFAULT_DROPZONE):
+        try:
+            for fname in os.listdir(DEFAULT_DROPZONE):
+                fpath = os.path.join(DEFAULT_DROPZONE, fname)
+                if os.path.isfile(fpath):
+                    os.remove(fpath)
+            print(f"[RESET] Cleared DropZone folder: {DEFAULT_DROPZONE}")
+        except Exception as e:
+            print(f"[RESET] Failed to clear DropZone: {e}")
+
+
 
 # =============================================================================
 # FLOATING DESKTOP HUD OVERLAY
@@ -480,6 +512,15 @@ class CosmicLinkApp:
             return
 
         self.last_btn3_press = 0.0
+        self.last_mouse_x = None
+
+        def on_move(x, y):
+            if self.last_mouse_x is not None:
+                dx = x - self.last_mouse_x
+                # Real-time heading update from Air Mouse motion
+                yaw_delta = dx * 0.30
+                self.current_yaw = (self.current_yaw + yaw_delta) % 360
+            self.last_mouse_x = x
 
         def on_click(x, y, button, pressed):
             # Middle button (or Button 3 on Air Mouse) triggers Spatial Beam
@@ -501,7 +542,7 @@ class CosmicLinkApp:
                         self.is_holding_beam = False
                         self.root.after(0, self.on_beam_hold_release)
 
-        listener = mouse.Listener(on_click=on_click)
+        listener = mouse.Listener(on_move=on_move, on_click=on_click)
         listener.daemon = True
         listener.start()
 
@@ -518,7 +559,17 @@ class CosmicLinkApp:
             self.pairing_pending_device = None
             return
 
-        self.hud.show("⚡ READY TO SEND [Aiming...]", status="ready")
+        # Check staged file payload
+        try:
+            fname, _, _ = self.get_staged_payload()
+            if "screenshot" in fname:
+                status_text = "⚡ READY TO SEND [Screenshot]"
+            else:
+                status_text = f"⚡ READY TO SEND [{fname}]"
+        except Exception:
+            status_text = "⚡ READY TO SEND [Aiming...]"
+
+        self.hud.show(status_text, status="ready")
 
     def on_beam_hold_release(self):
         if self.target_locked:
@@ -628,9 +679,30 @@ class CosmicLinkApp:
         except Exception:
             pass
 
-        # 2. Check if an actual file path is copied in the clipboard
+        # 2. Check if a file was copied to clipboard in Windows Explorer (CF_HDROP)
         try:
-            cb = self.root.clipboard_get()
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            if win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_HDROP):
+                file_list = win32clipboard.GetClipboardData(win32clipboard.CF_HDROP)
+                win32clipboard.CloseClipboard()
+                if file_list and os.path.isfile(file_list[0]):
+                    selected_path = file_list[0]
+                    fname = os.path.basename(selected_path)
+                    fsize = os.path.getsize(selected_path)
+                    return fname, selected_path, fsize
+            else:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            try:
+                import win32clipboard
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+
+        # 3. Check if an actual file path string is in the clipboard
+        try:
+            cb = self.root.clipboard_get().strip('"\' ')
             if cb and os.path.isfile(cb):
                 fname = os.path.basename(cb)
                 fsize = os.path.getsize(cb)
@@ -740,13 +812,20 @@ class CosmicLinkApp:
     # UPDATE LOOP
     # -------------------------------------------------------------------------
     def update_loop(self):
+        heading = self.calculate_relative_heading(self.current_yaw)
         if self.is_holding_beam:
             target = self.evaluate_target_lock()
             if target:
                 self.hud.show(f"🎯 TARGET LOCKED: {target.upper()} (Release to Beam)", status="locked")
             else:
-                heading = self.calculate_relative_heading(self.current_yaw)
-                self.hud.show(f"⚡ READY TO SEND [Aiming: {int(heading)}°]", status="ready")
+                try:
+                    fname, _, _ = self.get_staged_payload()
+                    target_label = f"[{fname}]" if "screenshot" not in fname else "[Screenshot]"
+                except Exception:
+                    target_label = "[Aiming...]"
+                self.hud.show(f"⚡ READY TO SEND {target_label} ({int(heading)}°)", status="ready")
+        else:
+            self.radar.update_heading(heading, self.target_locked)
 
         self.root.after(50, self.update_loop)
 
