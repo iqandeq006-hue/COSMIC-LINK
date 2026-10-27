@@ -101,6 +101,8 @@ class ConfigManager:
             "pairing_key": DEFAULT_PAIRING_KEY,
             "dropzone": DEFAULT_DROPZONE,
             "auto_display": True,
+            "radar_sensitivity": 0.18,
+            "aim_only_on_hold": True,
             "devices": {}  # name -> {"ip": ..., "angle": float, "last_seen": float, "trusted": bool}
         }
         self.load()
@@ -396,7 +398,37 @@ class CosmicLinkApp:
             left_col, text="🎯 Re-center (0°)", bg="#238636", fg="white", font=("Segoe UI", 9, "bold"),
             relief="flat", command=self.recenter_zero
         )
-        btn_recenter.pack(fill=tk.X, padx=16, pady=(4, 8))
+        btn_recenter.pack(fill=tk.X, padx=16, pady=(4, 4))
+
+        # Radar Spin Sensitivity Controls
+        sens_box = tk.Frame(left_col, bg="#161b22")
+        sens_box.pack(fill=tk.X, padx=16, pady=(2, 6))
+
+        cur_sens = self.cfg.get("radar_sensitivity", 0.18)
+        self.lbl_sens_val = tk.Label(
+            sens_box,
+            text=f"Radar Spin Speed: {int(cur_sens * 100)}%",
+            font=("Segoe UI", 8, "bold"),
+            bg="#161b22",
+            fg="#58a6ff"
+        )
+        self.lbl_sens_val.pack(anchor=tk.W)
+
+        self.slider_radar_sens = tk.Scale(
+            sens_box, from_=0.04, to=0.50, resolution=0.01, orient=tk.HORIZONTAL,
+            bg="#161b22", fg="#79c0ff", highlightthickness=0, showvalue=False,
+            command=self.on_radar_sens_change
+        )
+        self.slider_radar_sens.set(cur_sens)
+        self.slider_radar_sens.pack(fill=tk.X, pady=(1, 2))
+
+        self.var_aim_only = tk.BooleanVar(value=self.cfg.get("aim_only_on_hold", True))
+        chk_aim = tk.Checkbutton(
+            sens_box, text="Spin only when holding Button 3", variable=self.var_aim_only,
+            bg="#161b22", fg="#8b949e", selectcolor="#0d1117", activebackground="#161b22", font=("Segoe UI", 8),
+            command=self.save_settings
+        )
+        chk_aim.pack(anchor=tk.W)
 
         # Workflow Instructions
         lbl_hint = tk.Label(
@@ -563,9 +595,20 @@ class CosmicLinkApp:
             self.log(f"🔑 Shared Pairing Key updated to '{new_key}'.")
             messagebox.showinfo("Pairing Key", f"Pairing Key set to:\n{new_key}\n\nEnter this exact key on your other laptop.")
 
+    def on_radar_sens_change(self, val):
+        sens = float(val)
+        self.cfg["radar_sensitivity"] = round(sens, 2)
+        if hasattr(self, "lbl_sens_val"):
+            self.lbl_sens_val.config(text=f"Radar Spin Speed: {int(sens * 100)}%")
+        self.cfg_mgr.save()
+
     def save_settings(self):
         self.cfg["auto_display"] = self.var_autodisplay.get()
         self.cfg["dropzone"] = self.entry_dz.get()
+        if hasattr(self, "var_aim_only"):
+            self.cfg["aim_only_on_hold"] = self.var_aim_only.get()
+        if hasattr(self, "slider_radar_sens"):
+            self.cfg["radar_sensitivity"] = float(self.slider_radar_sens.get())
         self.cfg_mgr.save()
 
     def recenter_zero(self):
@@ -608,8 +651,13 @@ class CosmicLinkApp:
         def on_move(x, y):
             if self.last_mouse_x is not None:
                 dx = x - self.last_mouse_x
-                yaw_delta = dx * 0.30
-                self.current_yaw = (self.current_yaw + yaw_delta) % 360
+                aim_only = self.cfg.get("aim_only_on_hold", True)
+
+                # Only spin radar reticle if holding Button 3, or if aim_only_on_hold is turned off
+                if self.is_holding_beam or not aim_only:
+                    sens = self.cfg.get("radar_sensitivity", 0.18)
+                    yaw_delta = dx * sens
+                    self.current_yaw = (self.current_yaw + yaw_delta) % 360
 
                 # Screen edge warp while holding beam so aiming never traps at monitor edge
                 if self.is_holding_beam:
